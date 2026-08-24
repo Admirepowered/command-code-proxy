@@ -998,6 +998,19 @@ def build_models(cfg):
     return [{"id": mid, "object": "model", "owned_by": "command-code"} for mid in ids]
 
 
+def iter_sse_lines(resp):
+    """Yield upstream SSE lines decoded as UTF-8, regardless of Content-Type.
+
+    requests' decode_unicode=True falls back to ISO-8859-1 when the response
+    has no charset (typical for text/event-stream), which garbles non-ASCII
+    text ("ä½ å¥½" mojibake). Read bytes and decode explicitly instead.
+    """
+    for raw in resp.iter_lines():
+        if raw is None:
+            continue
+        yield raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+
+
 def error_envelope(status, message, code=None, type_="invalid_request_error"):
     return {"error": {"message": message, "type": type_, "code": code, "status": status}}
 
@@ -1230,7 +1243,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._sse_headers()
         try:
             self._write_anthropic_event(*translator._start_event())
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in iter_sse_lines(resp):
                 if not line:
                     continue
                 try:
@@ -1272,7 +1285,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _buffer_anthropic(self, resp, translator):
         try:
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in iter_sse_lines(resp):
                 if not line:
                     continue
                 try:
@@ -1315,7 +1328,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _stream_response(self, resp, translator):
         self._sse_headers()
         try:
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in iter_sse_lines(resp):
                 if not line:
                     continue
                 try:
@@ -1341,7 +1354,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._write_sse_event("response.in_progress",
                                   {"type": "response.in_progress",
                                    "response": translator.meta_response("in_progress")})
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in iter_sse_lines(resp):
                 if not line:
                     continue
                 try:
@@ -1383,7 +1396,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _buffer_response(self, resp, translator):
         try:
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in iter_sse_lines(resp):
                 if not line:
                     continue
                 try:
@@ -1402,7 +1415,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _buffer_responses(self, resp, translator):
         try:
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in iter_sse_lines(resp):
                 if not line:
                     continue
                 try:
