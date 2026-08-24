@@ -1,0 +1,89 @@
+# command-code OpenAI bridge
+
+A small local proxy that exposes an **OpenAI-compatible** Chat Completions API and forwards
+requests to the command-code `/alpha/generate` endpoint, translating requests and responses
+both ways.
+
+Other apps (NextChat, Cherry Studio, scripts using the OpenAI SDK, etc.) point their
+`base_url` at this proxy and talk standard OpenAI; this server does the translation.
+
+```
+your app ── OpenAI /v1/chat/completions ──> bridge (python main.py) ── native /alpha/generate ──> api.commandcode.ai
+```
+
+## Requirements
+
+- Python 3.10+ (tested on 3.14)
+- `requests` (`pip install requests` — usually already present)
+
+## Configuration
+
+Edit `.env` (same directory as `main.py`):
+
+| key               | description                                              |
+|-------------------|----------------------------------------------------------|
+| `base_url`        | command-code endpoint (defaults to `/alpha/generate`)    |
+| `auth_token`      | your command-code CLI key (`user_...`)                   |
+| `host`            | listen address (default `0.0.0.0`)                       |
+| `port`            | listen port (default `8080`)                             |
+| `default_model`   | model used when the client omits `model`                 |
+| `models`          | comma-separated catalog returned by `GET /v1/models`     |
+| `working_dir`     | native request `workingDir` (default `/tmp`)             |
+| `environment`     | native request `environment` (default `terminal`)        |
+| `memory` / `taste`| native request memory / taste strings (default empty)    |
+| `skills`          | native request skills (default empty → null)             |
+| `permission_mode` | native request `permissionMode` (default `standard`)     |
+
+## Run
+
+```bash
+python main.py
+```
+
+Endpoints:
+
+- `POST /v1/chat/completions` — OpenAI-compatible chat (streaming and non-streaming)
+- `GET  /v1/models` — model list
+
+Point your client at `http://localhost:8080/v1` (e.g. base URL `http://localhost:8080/v1`,
+any API key).
+
+## Quick check
+
+```bash
+# streaming
+curl -N http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"stream":true}'
+
+# non-streaming
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}'
+```
+
+## Translation notes
+
+- **System prompt** — OpenAI `system`/`developer` messages are joined into the native
+  `params.system` field.
+- **Tools** — OpenAI `{type:"function", function:{...}}` schemas are converted to the native
+  `{name, description, input_schema}` shape. Tool-call events are streamed back as OpenAI
+  `delta.tool_calls`. Note: the upstream emits tool calls but cannot execute them or accept
+  tool results within a single call, so `role:"tool"` results in history are flattened into
+  user messages.
+- **Streaming** — upstream always receives `stream: true` (the CLI endpoint rejects
+  non-streaming requests). Non-streaming clients get a buffered single JSON response.
+- **Reasoning** — reasoning deltas are exposed as `delta.reasoning_content`
+  (DeepSeek convention).
+- **Errors** — upstream errors are re-enveloped in the OpenAI error shape.
+
+## ⚠️ Risk disclosure
+
+The `/alpha/generate` endpoint is intended for the command-code **CLI** only. commandcode.ai
+actively detects proxying and warns that *"continued proxying of your subscription violates the
+TOS and will result in account ban."* Using this bridge may get your account banned.
+
+A legitimate alternative exists: the official **Command Code Provider API**
+(`https://api.commandcode.ai/provider/v1`, OpenAI- and Anthropic-compatible, same key), which
+requires a plan with API access (GOAT/Provider+; the Go plan returns 403 `upgrade_required`).
+If your plan supports it, point your apps there directly and skip this bridge entirely.
