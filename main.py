@@ -519,6 +519,7 @@ class ResponsesTranslator:
         self._msg_id = None
         self._msg_index = None
         self._current_tool = None
+        self.completed = False   # True once a native 'finish' event is seen
 
     def meta_response(self, status="in_progress"):
         return {
@@ -661,6 +662,7 @@ class ResponsesTranslator:
         if etype == "finish":
             self.finish_reason = map_finish_reason(obj.get("finishReason"))
             self.usage = responses_usage(obj.get("totalUsage") or {})
+            self.completed = True
             return [("response.completed", self.final_response(status="completed"))]
         return []
 
@@ -927,6 +929,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     continue
                 for event_type, data in translator.on_event(obj):
                     self._write_sse_event(event_type, data)
+            # Upstream may end without a native 'finish' event; never leave the
+            # client without a terminal event, or it reports a bare disconnect.
+            if not translator.completed:
+                self._write_sse_event("response.completed",
+                                      {"type": "response.completed",
+                                       "response": translator.final_response(status="completed")})
             # Close the connection so clients see EOF after response.completed.
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
@@ -937,6 +945,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     "type": "response.failed",
                     "response": translator.final_response(status="failed"),
                     "error": {"code": "upstream_error", "message": str(exc)},
+                })
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        except Exception as exc:  # noqa: BLE001 -- a broken stream must never
+            try:                  # end with a bare disconnect
+                self._write_sse_event("response.failed", {
+                    "type": "response.failed",
+                    "response": translator.final_response(status="failed"),
+                    "error": {"code": "translation_error", "message": str(exc)},
                 })
             except (BrokenPipeError, ConnectionResetError):
                 pass
