@@ -792,7 +792,10 @@ class ResponsesTranslator:
             self.finish_reason = map_finish_reason(obj.get("finishReason"))
             self.usage = responses_usage(obj.get("totalUsage") or {})
             self.completed = True
-            return [("response.completed", self.final_response(status="completed"))]
+            return [("response.completed", {
+                "type": "response.completed",
+                "response": self.final_response(status="completed"),
+            })]
         return []
 
     def final_response(self, status="completed"):
@@ -1320,6 +1323,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _write_sse_event(self, event_type, data):
+        # Responses-API SSE clients (openai SDK / codex) dispatch on the
+        # top-level `type` field inside the JSON data, NOT on the `event:`
+        # header -- a payload without it is silently dropped and the client
+        # reports "stream ended before response.completed". Guarantee every
+        # event carries its type (the Anthropic payloads already include it).
+        if "type" not in data:
+            data = {"type": event_type, **data}
         payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
         self.wfile.write(b"data: " + payload + b"\n\n")
