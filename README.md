@@ -1,14 +1,15 @@
 # command-code OpenAI bridge
 
-A small local proxy that exposes an **OpenAI-compatible** Chat Completions API and forwards
-requests to the command-code `/alpha/generate` endpoint, translating requests and responses
-both ways.
+A small local proxy that exposes an **OpenAI-compatible** API (Chat Completions **and**
+Responses) and forwards requests to the command-code `/alpha/generate` endpoint, translating
+requests and responses both ways.
 
-Other apps (NextChat, Cherry Studio, scripts using the OpenAI SDK, etc.) point their
+Other apps (NextChat, Cherry Studio, Codex, scripts using the OpenAI SDK, etc.) point their
 `base_url` at this proxy and talk standard OpenAI; this server does the translation.
 
 ```
-your app ── OpenAI /v1/chat/completions ──> bridge (python main.py) ── native /alpha/generate ──> api.commandcode.ai
+your app ── OpenAI /v1/chat/completions  ─┐
+            OpenAI /v1/responses         ─┴─> bridge (python main.py) ── native /alpha/generate ──> api.commandcode.ai
 ```
 
 ## Requirements
@@ -43,6 +44,7 @@ python main.py
 Endpoints:
 
 - `POST /v1/chat/completions` — OpenAI-compatible chat (streaming and non-streaming)
+- `POST /v1/responses` — OpenAI Responses API (streaming and non-streaming; what Codex uses)
 - `GET  /v1/models` — model list
 
 Point your client at `http://localhost:8080/v1` (e.g. base URL `http://localhost:8080/v1`,
@@ -60,7 +62,28 @@ curl -N http://localhost:8080/v1/chat/completions \
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}'
+
+# Responses API (Codex)
+curl -N http://localhost:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek/deepseek-v4-flash","instructions":"You are a terse assistant.","input":"hello","stream":true}'
 ```
+
+## Responses API (`/v1/responses`)
+
+Requests are translated from the Responses format to the same native call:
+- `instructions` (or `input` items with `type:"message"` / `role:"system"`) → native `params.system`
+- `input` items (`input_text`/`input_image`/`output_text`/`function_call`/`function_call_output`) →
+  native `messages` (tool outputs are flattened into user messages)
+- `tools` (`{type:"function", name, description, parameters}`) → native Anthropic shape;
+  `web_search`/`web_search_preview` → built-in `web_search_20250305`, `web_fetch` → `web_fetch_20250910`
+- `tool_choice`, `max_output_tokens`, `temperature`, `top_p` → mapped equivalents
+
+Streaming responses are re-emitted as the standard Responses SSE event sequence
+(`response.created`, `response.output_item.added`, `response.output_text.delta`,
+`response.function_call_arguments.delta`, … `response.completed`). Reasoning tokens are
+exposed via `response.reasoning_summary_text.delta` events. Non-streaming clients get a
+single complete `Response` object.
 
 ## Translation notes
 
