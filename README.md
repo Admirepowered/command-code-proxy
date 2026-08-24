@@ -1,15 +1,18 @@
 # command-code OpenAI bridge
 
-A small local proxy that exposes an **OpenAI-compatible** API (Chat Completions **and**
-Responses) and forwards requests to the command-code `/alpha/generate` endpoint, translating
-requests and responses both ways.
+A small local proxy that exposes **OpenAI-compatible** (Chat Completions, Responses) and
+**Anthropic-compatible** (Messages) APIs and forwards requests to the command-code
+`/alpha/generate` endpoint, translating requests and responses both ways.
 
-Other apps (NextChat, Cherry Studio, Codex, scripts using the OpenAI SDK, etc.) point their
-`base_url` at this proxy and talk standard OpenAI; this server does the translation.
+Other apps (NextChat, Cherry Studio, Codex, Claude Code, scripts using the OpenAI or Anthropic
+SDKs, etc.) point their `base_url` at this proxy and talk standard OpenAI/Anthropic; this server
+does the translation.
 
 ```
 your app ── OpenAI /v1/chat/completions  ─┐
-            OpenAI /v1/responses         ─┴─> bridge (python main.py) ── native /alpha/generate ──> api.commandcode.ai
+            OpenAI /v1/responses         ─┤
+                                          ├─> bridge (python main.py) ── native /alpha/generate ──> api.commandcode.ai
+            Anthropic /v1/messages       ─┘
 ```
 
 ## Requirements
@@ -45,6 +48,7 @@ Endpoints:
 
 - `POST /v1/chat/completions` — OpenAI-compatible chat (streaming and non-streaming)
 - `POST /v1/responses` — OpenAI Responses API (streaming and non-streaming; what Codex uses)
+- `POST /v1/messages` — Anthropic Messages API (streaming and non-streaming; what Claude Code uses)
 - `GET  /v1/models` — model list
 
 Point your client at `http://localhost:8080/v1` (e.g. base URL `http://localhost:8080/v1`,
@@ -84,6 +88,24 @@ Streaming responses are re-emitted as the standard Responses SSE event sequence
 `response.function_call_arguments.delta`, … `response.completed`). Reasoning tokens are
 exposed via `response.reasoning_summary_text.delta` events. Non-streaming clients get a
 single complete `Response` object.
+
+## Anthropic Messages API (`/v1/messages`)
+
+Requests are translated from the Anthropic format to the same native call:
+- `system` (string or text blocks) → native `params.system`
+- `messages` content blocks: `text` → plain text; `tool_result` → `"[tool result for <id>]"`
+  user text (same convention as the OpenAI path); `tool_use` in history → `"[called tool ...]"`
+  marker; `image`/`document` → inline placeholders
+- `tools` — Anthropic `{name, description, input_schema}` already matches the native shape and
+  passes through; built-in `web_search_20250305`/`web_fetch_20250910` pass through untouched
+- `tool_choice` (`auto`/`any`/`none`/`{type:"tool", name}`) → mapped equivalents
+- `max_tokens`, `temperature`, `top_p`, `stop_sequences` → mapped equivalents
+
+Streaming responses use the standard Anthropic SSE sequence: `message_start` →
+`content_block_start` / `content_block_delta` (`thinking_delta`, `text_delta`,
+`input_json_delta`) / `content_block_stop` → `message_delta` (stop_reason + usage) →
+`message_stop`. Reasoning is surfaced as a `thinking` block. Non-streaming clients get a single
+complete message object with parsed `tool_use.input`. Errors use the Anthropic error envelope.
 
 ## Translation notes
 

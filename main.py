@@ -357,6 +357,135 @@ def convert_responses_request(openai_body, cfg):
 
 
 # ---------------------------------------------------------------------------
+# Anthropic Messages API (/v1/messages) request conversion
+# ---------------------------------------------------------------------------
+
+
+def anthropic_blocks_to_text(content):
+    """Flatten Anthropic content (string or block list) into plain text."""
+    if isinstance(content, str):
+        return content
+    out = []
+    for block in content or []:
+        if isinstance(block, str):
+            out.append(block)
+        elif isinstance(block, dict):
+            btype = block.get("type")
+            if btype == "text":
+                out.append(block.get("text", ""))
+            elif btype == "tool_result":
+                out.append(anthropic_blocks_to_text(block.get("content")))
+            elif btype in ("image", "document"):
+                out.append(f"[{btype}]")
+            elif "text" in block:
+                out.append(str(block.get("text", "")))
+    return "\n".join(t for t in out if t)
+
+
+def convert_anthropic_messages(messages):
+    """Convert Anthropic messages to native user/assistant-only messages.
+
+    tool_result blocks are flattened into "[tool result for <id>]" text (same
+    convention as the OpenAI path); tool_use blocks in assistant history are
+    kept as a short "[called tool ...]" marker so the model sees its own prior
+    actions.
+    """
+    native = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            native.append({"role": role, "content": content})
+            continue
+        parts = []
+        for block in content or []:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_result":
+                result_text = anthropic_blocks_to_text(block.get("content"))
+                parts.append(f"[tool result for {block.get('tool_use_id') or '?'}]\n{result_text}")
+            elif btype == "tool_use":
+                called_input = json.dumps(block.get("input") or {}, ensure_ascii=False)
+                parts.append(f"[called tool {block.get('name', '?')}({called_input})]")
+            elif btype in ("image", "document"):
+                parts.append(f"[{btype}]")
+        text = "\n".join(p for p in parts if p)
+        if text:
+            native.append({"role": role, "content": text})
+    return native
+
+
+def convert_anthropic_tools(tools):
+    """Pass Anthropic tool schemas through — they already match the native
+    {name, description, input_schema} shape. Built-in web_search/web_fetch
+    share the same type names, so they pass through untouched too."""
+    out = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        ttype = tool.get("type")
+        if ttype in ("web_search_20250305", "web_fetch_20250910"):
+            out.append(tool)
+        elif tool.get("name"):
+            out.append({
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("input_schema")
+                                or {"type": "object", "properties": {}},
+            })
+    return out
+
+
+def convert_anthropic_tool_choice(tool_choice):
+    """Map Anthropic tool_choice ({type: auto|any|none|tool}) to the native
+    AI-SDK toolChoice value."""
+    if not isinstance(tool_choice, dict):
+        return None
+    ttype = tool_choice.get("type")
+    if ttype == "any":
+        return "required"
+    if ttype in ("auto", "none"):
+        return ttype
+    if ttype == "tool" and tool_choice.get("name"):
+        return {"type": "tool", "toolName": tool_choice["name"]}
+    return None
+
+
+def convert_anthropic_request(body, cfg):
+    """Translate an Anthropic Messages-API (/v1/messages) body into the native body."""
+    params = {
+        "model": body.get("model") or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
+        "messages": convert_anthropic_messages(body.get("messages")),
+        "system": anthropic_blocks_to_text(body.get("system")),
+        "stream": True,
+    }
+    tools = convert_anthropic_tools(body.get("tools"))
+    if tools:
+        params["tools"] = tools
+    tool_choice = convert_anthropic_tool_choice(body.get("tool_choice"))
+    if tool_choice is not None:
+        params["toolChoice"] = tool_choice
+    if body.get("max_tokens") is not None:
+        params["max_tokens"] = body["max_tokens"]
+    for key in ("temperature", "top_p"):
+        if body.get(key) is not None:
+            params[key] = body[key]
+    if body.get("stop_sequences"):
+        params["stop"] = body["stop_sequences"]
+    return build_native_body(params, cfg)
+
+
+# ---------------------------------------------------------------------------
 # Native response translation
 # ---------------------------------------------------------------------------
 
@@ -690,6 +819,175 @@ class ResponsesTranslator:
         }
 
 
+class AnthropicTranslator:
+    """Consumes native stream-part events, emits Anthropic Messages-API events.
+
+    Event sequence: message_start -> per content block (content_block_start ->
+    text_delta / input_json_delta -> content_block_stop) -> message_delta
+    (with stop_reason + usage) -> message_stop. Reasoning is surfaced as a
+    dedicated thinking block.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.id = f"msg_{uuid.uuid4().hex[:24]}"
+        self.created_at = int(time.time())
+        self.reasoning = []
+        self.text = []
+        self.tool_calls = []   # {index, id, name, input}
+        self.stop_reason = None
+        self.usage = None
+        self.blocks = []       # completed blocks for the buffered path
+        self._block_index = -1     # index of the currently open block
+        self._block_type = None
+        self._tool = None
+        self.completed = False
+
+    # -- event construction helpers ----------------------------------------
+
+    def _start_event(self):
+        return ("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": self.id,
+                "type": "message",
+                "role": "assistant",
+                "model": self.model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        })
+
+    def _block_start(self, block):
+        """Open a new content block; returns the content_block_start event."""
+        self._block_index += 1
+        self._block_type = block["type"]
+        return ("content_block_start", {
+            "type": "content_block_start",
+            "index": self._block_index,
+            "content_block": block,
+        })
+
+    def _block_stop(self):
+        return ("content_block_stop", {
+            "type": "content_block_stop",
+            "index": self._block_index,
+        })
+
+    def anthropic_usage(self, total_usage):
+        return {
+            "input_tokens": total_usage.get("inputTokens") or 0,
+            "output_tokens": total_usage.get("outputTokens") or 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": total_usage.get("cachedInputTokens") or 0,
+        }
+
+    def final_message(self, stop_reason=None):
+        content = []
+        if self.reasoning:
+            content.append({"type": "thinking",
+                            "thinking": "".join(self.reasoning)})
+        content.append({"type": "text", "text": "".join(self.text)})
+        for tc in self.tool_calls:
+            content.append({"type": "tool_use", "id": tc["id"],
+                            "name": tc["name"], "input": tc["input"]})
+        return {
+            "id": self.id,
+            "type": "message",
+            "role": "assistant",
+            "model": self.model,
+            "content": content,
+            "stop_reason": stop_reason or self.stop_reason or "end_turn",
+            "stop_sequence": None,
+            "usage": self.usage or {
+                "input_tokens": 0, "output_tokens": 0,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            },
+        }
+
+    # -- main entry ----------------------------------------------------------
+
+    def on_event(self, obj):
+        """Translate one native event; return a list of (event_type, data)."""
+        etype = obj.get("type")
+        out = []
+        if etype == "reasoning-start":
+            out.append(self._block_start({"type": "thinking", "thinking": ""}))
+        elif etype == "reasoning-delta":
+            if self._block_type != "thinking":
+                out.append(self._block_start({"type": "thinking", "thinking": ""}))
+            self.reasoning.append(obj.get("text", ""))
+            out.append(("content_block_delta", {
+                "type": "content_block_delta", "index": self._block_index,
+                "delta": {"type": "thinking_delta", "thinking": obj.get("text", "")},
+            }))
+        elif etype == "reasoning-end":
+            if self._block_type == "thinking":
+                self.blocks.append({"type": "thinking", "thinking": "".join(self.reasoning)})
+                out.append(self._block_stop())
+                self._block_type = None
+        elif etype == "text-start":
+            out.append(self._block_start({"type": "text", "text": ""}))
+        elif etype == "text-delta":
+            if self._block_type != "text":
+                out.append(self._block_start({"type": "text", "text": ""}))
+            self.text.append(obj.get("text", ""))
+            out.append(("content_block_delta", {
+                "type": "content_block_delta", "index": self._block_index,
+                "delta": {"type": "text_delta", "text": obj.get("text", "")},
+            }))
+        elif etype == "text-end":
+            if self._block_type == "text":
+                self.blocks.append({"type": "text", "text": "".join(self.text)})
+                out.append(self._block_stop())
+                self._block_type = None
+        elif etype == "tool-input-start":
+            call_id = obj.get("id", f"toolu_{uuid.uuid4().hex[:16]}")
+            name = obj.get("toolName", "")
+            self._tool = {"index": None, "id": call_id, "name": name, "input_raw": ""}
+            out.append(self._block_start({
+                "type": "tool_use", "id": call_id, "name": name, "input": {},
+            }))
+            self._tool["index"] = self._block_index
+        elif etype == "tool-input-delta":
+            if self._tool is not None:
+                self._tool["input_raw"] += obj.get("delta", "")
+                out.append(("content_block_delta", {
+                    "type": "content_block_delta", "index": self._block_index,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": obj.get("delta", "")},
+                }))
+        elif etype == "tool-input-end":
+            if self._tool is not None:
+                try:
+                    parsed = json.loads(self._tool["input_raw"]) if self._tool["input_raw"] else {}
+                except ValueError:
+                    parsed = {}
+                self.tool_calls.append({"id": self._tool["id"], "name": self._tool["name"],
+                                        "input": parsed})
+                self.blocks.append({"type": "tool_use", "id": self._tool["id"],
+                                    "name": self._tool["name"], "input": parsed})
+                out.append(self._block_stop())
+                self._tool = None
+                self._block_type = None
+        elif etype == "finish":
+            reason = obj.get("finishReason")
+            self.stop_reason = "tool_use" if map_finish_reason(reason) == "tool_calls" else "end_turn"
+            if reason == "length":
+                self.stop_reason = "max_tokens"
+            self.usage = self.anthropic_usage(obj.get("totalUsage") or {})
+            self.completed = True
+            out.append(("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": self.usage["output_tokens"]},
+            }))
+            out.append(("message_stop", {"type": "message_stop"}))
+        return out
+
+
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
@@ -818,6 +1116,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._handle_chat_completions()
         elif path == "/v1/responses":
             self._handle_responses()
+        elif path == "/v1/messages":
+            self._handle_messages()
         else:
             self._send_json(404, error_envelope(404, "Not Found", code="not_found"))
 
@@ -866,6 +1166,127 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._stream_responses(resp, translator)
         else:
             self._buffer_responses(resp, translator)
+
+    # -- Anthropic messages --------------------------------------------------
+
+    def _anthropic_error(self, status, message, err_type="invalid_request_error"):
+        """Anthropic-shaped error body."""
+        self._send_json(status, {"type": "error",
+                                 "error": {"type": err_type, "message": message}})
+
+    def _upstream_ok_anthropic(self, resp):
+        """Like _upstream_ok but replies with an Anthropic error envelope."""
+        if resp.status_code == 200:
+            return True
+        try:
+            upstream_body = resp.json()
+        except ValueError:
+            upstream_body = None
+        self._close_upstream(resp)
+        if upstream_body and isinstance(upstream_body, dict) and upstream_body.get("error"):
+            err = upstream_body["error"]
+            message = err.get("message") or "upstream request failed"
+            status = err.get("status") or resp.status_code
+        else:
+            message = f"upstream returned HTTP {resp.status_code}"
+            status = resp.status_code
+        self._anthropic_error(status, message, err_type="api_error")
+        return False
+
+    def _handle_messages(self):
+        cfg = self.server.cfg
+        body = self._read_json_body()
+        if body is None:
+            self._anthropic_error(400, "Invalid JSON body")
+            return
+
+        native_body = convert_anthropic_request(body, cfg)
+        client_wants_stream = bool(body.get("stream"))
+
+        resp = self._upstream_post(native_body, cfg)
+        if resp is None:
+            return
+        # _upstream_post already replied on connection failure; _upstream_ok
+        # would reply in OpenAI shape, so use the Anthropic variant instead.
+        if not self._upstream_ok_anthropic(resp):
+            return
+
+        translator = AnthropicTranslator(body.get("model")
+                                         or cfg.get("default_model")
+                                         or "deepseek/deepseek-v4-flash")
+
+        if client_wants_stream:
+            self._stream_anthropic(resp, translator)
+        else:
+            self._buffer_anthropic(resp, translator)
+
+    def _write_anthropic_event(self, event_type, data):
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
+        self.wfile.write(b"data: " + payload + b"\n\n")
+        self.wfile.flush()
+
+    def _stream_anthropic(self, resp, translator):
+        self._sse_headers()
+        try:
+            self._write_anthropic_event(*translator._start_event())
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                for event_type, data in translator.on_event(obj):
+                    self._write_anthropic_event(event_type, data)
+            # The upstream may end without a native 'finish' event; never leave
+            # the stream without terminal events.
+            if not translator.completed:
+                self._write_anthropic_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": sum(len(t) for t in translator.text)},
+                })
+                self._write_anthropic_event("message_stop", {"type": "message_stop"})
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away; stop pulling upstream (don't waste tokens)
+        except requests.RequestException as exc:
+            try:
+                self._write_anthropic_event("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(exc)},
+                })
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        except Exception as exc:  # noqa: BLE001 -- a broken stream must never
+            try:                  # end with a bare disconnect
+                self._write_anthropic_event("error", {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(exc)},
+                })
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        finally:
+            self._close_upstream(resp)
+
+    def _buffer_anthropic(self, resp, translator):
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                translator.on_event(obj)
+            self._close_upstream(resp)
+        except requests.RequestException as exc:
+            self._close_upstream(resp)
+            self._anthropic_error(502, f"upstream stream failed: {exc}",
+                                  err_type="api_error")
+            return
+        self._send_json(200, translator.final_message())
 
     # -- streaming helpers --------------------------------------------------
 
@@ -1014,7 +1435,8 @@ def main():
     print(f"[command-code bridge] default model: {cfg['default_model']}")
     print(f"[command-code bridge] models catalog ({len(server.models)}): "
           + ", ".join(m["id"] for m in server.models))
-    print("[command-code bridge] endpoints: POST /v1/chat/completions, POST /v1/responses, GET /v1/models")
+    print("[command-code bridge] endpoints: POST /v1/chat/completions, POST /v1/responses, "
+          "POST /v1/messages (Anthropic), GET /v1/models")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
