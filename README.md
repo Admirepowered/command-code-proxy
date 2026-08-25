@@ -31,12 +31,29 @@ Edit `.env` (same directory as `main.py`):
 | `host`            | listen address (default `0.0.0.0`)                       |
 | `port`            | listen port (default `8080`)                             |
 | `default_model`   | model used when the client omits `model`                 |
-| `models`          | comma-separated catalog returned by `GET /v1/models`     |
-| `working_dir`     | native request `workingDir` (default `/tmp`)             |
+| `models`          | comma-separated catalog returned by `GET /v1/models`     || `working_dir`     | native request `workingDir` (default `/tmp`)             |
 | `environment`     | native request `environment` (default `terminal`)        |
 | `memory` / `taste`| native request memory / taste strings (default empty)    |
 | `skills`          | native request skills (default empty → null)             |
 | `permission_mode` | native request `permissionMode` (default `standard`)     |
+
+### Model catalog (`models.py`)
+
+The full command-code model registry (59 models: Anthropic, OpenAI, DeepSeek,
+Kimi, GLM, MiniMax, Qwen, Gemini, Grok, …) lives in `models.py`. It serves two
+purposes:
+
+- **`GET /v1/models`** — the `.env` `models` list selects and orders the entries
+  shown to clients (matching works on canonical ids *or* aliases); leave it
+  empty to serve the whole visible registry. Two free promo models are hidden,
+  mirroring the CLI picker, but stay callable when requested explicitly.
+- **Id resolution** — every request's `model` field passes through
+  `models.resolve()`, which maps legacy and gateway-specific ids onto the
+  canonical id sent upstream (e.g. `claude-opus-4-6` → `claude-opus-4-7`,
+  `zai/glm-5.2` → `zai-org/GLM-5.2`, `openai/gpt-5.6-luna` → `gpt-5.6-luna`).
+  Unknown ids pass through unchanged, so brand-new upstream models work
+  without a catalog update.
+
 
 ## Run
 

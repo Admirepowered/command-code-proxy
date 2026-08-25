@@ -17,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
+import models as catalog
+
 # ---------------------------------------------------------------------------
 # Config (.env)
 # ---------------------------------------------------------------------------
@@ -219,7 +221,8 @@ def convert_openai_request(openai_body, cfg):
     tool_choice = convert_tool_choice(openai_body.get("tool_choice"))
 
     params = {
-        "model": openai_body.get("model") or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
+        "model": catalog.resolve(openai_body.get("model"))
+                 or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
         "messages": messages,
         "system": system,
         "stream": True,
@@ -338,7 +341,8 @@ def convert_responses_request(openai_body, cfg):
     tool_choice = convert_responses_tool_choice(openai_body.get("tool_choice"))
 
     params = {
-        "model": openai_body.get("model") or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
+        "model": catalog.resolve(openai_body.get("model"))
+                 or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
         "messages": messages,
         "system": system,
         "stream": True,
@@ -464,7 +468,8 @@ def convert_anthropic_tool_choice(tool_choice):
 def convert_anthropic_request(body, cfg):
     """Translate an Anthropic Messages-API (/v1/messages) body into the native body."""
     params = {
-        "model": body.get("model") or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
+        "model": catalog.resolve(body.get("model"))
+                 or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
         "messages": convert_anthropic_messages(body.get("messages")),
         "system": anthropic_blocks_to_text(body.get("system")),
         "stream": True,
@@ -996,9 +1001,32 @@ class AnthropicTranslator:
 # ---------------------------------------------------------------------------
 
 def build_models(cfg):
-    """Build the /v1/models catalog from the comma-separated `models` setting."""
-    ids = [m.strip() for m in (cfg.get("models") or "").split(",") if m.strip()]
-    return [{"id": mid, "object": "model", "owned_by": "command-code"} for mid in ids]
+    """Build the /v1/models catalog from the full model registry.
+
+    The `.env` `models` list selects and orders the entries (matching is done
+    on both canonical ids and aliases); when it's empty the whole registry is
+    served. Ids listed there but absent from the registry are appended so a
+    brand-new upstream model stays usable without editing models.py.
+    """
+    if cfg.get("models"):
+        seen = set()
+        picked = []
+        for raw in cfg["models"].split(","):
+            mid = raw.strip()
+            if not mid:
+                continue
+            canonical = catalog.resolve(mid)
+            entry = catalog.get(mid)
+            if entry and canonical not in seen:
+                seen.add(canonical)
+                picked.append({"id": entry["id"], "object": "model",
+                               "created": 0, "owned_by": entry["vendor"]})
+            elif not entry:
+                # Not in the registry (yet) — keep it callable anyway.
+                picked.append({"id": mid, "object": "model",
+                               "created": 0, "owned_by": "command-code"})
+        return picked
+    return catalog.openai_catalog()
 
 
 def iter_sse_lines(resp):
