@@ -87,10 +87,10 @@ def parts_to_text(parts):
     Handles both Chat Completions parts (text/image_url) and Responses-API
     parts (input_text/output_text/refusal/input_image/input_file). The native
     endpoint is text-only, so non-text parts are represented inline rather than
-    dropped silently.
+    dropped silently. A missing/None content array is treated as empty.
     """
     out = []
-    for part in parts:
+    for part in parts or []:
         if not isinstance(part, dict):
             continue
         ptype = part.get("type")
