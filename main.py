@@ -33,8 +33,6 @@ DEFAULTS = {
     "port": "8080",
     # model settings
     "default_model": "deepseek/deepseek-v4-flash",
-    "models": "deepseek/deepseek-v4-flash,deepseek/deepseek-v4-pro,"
-              "claude-sonnet-5,claude-fable-5,gpt-5.4,gpt-5.3-codex,moonshotai/Kimi-K3",
     # native request envelope (optional overrides)
     "working_dir": "/tmp",
     "environment": "terminal",
@@ -1000,32 +998,14 @@ class AnthropicTranslator:
 # HTTP handler
 # ---------------------------------------------------------------------------
 
-def build_models(cfg):
-    """Build the /v1/models catalog from the full model registry.
+def build_models():
+    """Build the /v1/models catalog straight from the models.py registry.
 
-    The `.env` `models` list selects and orders the entries (matching is done
-    on both canonical ids and aliases); when it's empty the whole registry is
-    served. Ids listed there but absent from the registry are appended so a
-    brand-new upstream model stays usable without editing models.py.
+    The `.env` `models` list is no longer read: every visible model defined in
+    models.py is served (hidden promo entries stay hidden, mirroring the CLI
+    picker). Ids absent from the registry remain callable anyway, because
+    catalog.resolve() passes unknown ids through unchanged.
     """
-    if cfg.get("models"):
-        seen = set()
-        picked = []
-        for raw in cfg["models"].split(","):
-            mid = raw.strip()
-            if not mid:
-                continue
-            canonical = catalog.resolve(mid)
-            entry = catalog.get(mid)
-            if entry and canonical not in seen:
-                seen.add(canonical)
-                picked.append({"id": entry["id"], "object": "model",
-                               "created": 0, "owned_by": entry["vendor"]})
-            elif not entry:
-                # Not in the registry (yet) — keep it callable anyway.
-                picked.append({"id": mid, "object": "model",
-                               "created": 0, "owned_by": "command-code"})
-        return picked
     return catalog.openai_catalog()
 
 
@@ -1480,7 +1460,7 @@ def main():
     cfg = get_config()
     server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), BridgeHandler)
     server.cfg = cfg
-    server.models = build_models(cfg)
+    server.models = build_models()
     print(f"[command-code bridge] listening on http://{cfg['host']}:{cfg['port']}")
     print(f"[command-code bridge] upstream: {cfg['base_url']}")
     print(f"[command-code bridge] default model: {cfg['default_model']}")
