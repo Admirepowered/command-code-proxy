@@ -770,6 +770,38 @@ class ResponsesTranslator:
             "output": [],
         }
 
+    def _close_reasoning(self):
+        """Close the reasoning item if one is open; return its done events.
+
+        Mirrors the Anthropic path: the upstream emits text-start /
+        tool-input-start *before* reasoning-end, so a new output item can open
+        while the reasoning item is still in_progress. Items must close in
+        order, or the client SDK keeps the reasoning item open and the
+        response appears to stall.
+        """
+        if self._reasoning_id is None:
+            return []
+        text = "".join(self.reasoning)
+        item = {"id": self._reasoning_id, "type": "reasoning", "status": "completed",
+                "summary": [{"type": "summary_text", "text": text}],
+                "content": [{"type": "reasoning_text", "text": text}]}
+        self.items.append(item)
+        out = [
+            ("response.reasoning_summary_text.done", {
+                "item_id": self._reasoning_id, "output_index": self._reasoning_index,
+                "summary_index": 0, "summary": item["summary"],
+            }),
+            ("response.output_item.done", {
+                "output_index": self._reasoning_index, "item": item,
+            }),
+        ]
+        self._reasoning_id = None
+        return out
+
+    def pending_reasoning_stop(self):
+        """Events that close a reasoning item left open when the stream ends."""
+        return self._close_reasoning()
+
     def on_event(self, obj):
         """Translate one native event; return a list of (event_type, data) pairs."""
         etype = obj.get("type")
@@ -793,29 +825,13 @@ class ResponsesTranslator:
             }))
             return out
         if etype == "reasoning-end":
-            if self._reasoning_id is None:
-                return []
-            text = "".join(self.reasoning)
-            item = {"id": self._reasoning_id, "type": "reasoning", "status": "completed",
-                    "summary": [{"type": "summary_text", "text": text}],
-                    "content": [{"type": "reasoning_text", "text": text}]}
-            self.items.append(item)
-            out = [
-                ("response.reasoning_summary_text.done", {
-                    "item_id": self._reasoning_id, "output_index": self._reasoning_index,
-                    "summary_index": 0, "summary": item["summary"],
-                }),
-                ("response.output_item.done", {
-                    "output_index": self._reasoning_index, "item": item,
-                }),
-            ]
-            self._reasoning_id = None
-            return out
+            return self._close_reasoning()
         if etype == "text-start":
+            out = self._close_reasoning()
             self._msg_index = self.output_index
             self.output_index += 1
             self._msg_id = f"msg_{uuid.uuid4().hex[:16]}"
-            return [
+            out += [
                 ("response.output_item.added", {
                     "output_index": self._msg_index,
                     "item": {"id": self._msg_id, "type": "message", "status": "in_progress",
@@ -827,6 +843,7 @@ class ResponsesTranslator:
                     "part": {"type": "output_text", "text": "", "annotations": []},
                 }),
             ]
+            return out
         if etype == "text-delta":
             self.text.append(obj.get("text", ""))
             return [("response.output_text.delta", {
@@ -858,6 +875,7 @@ class ResponsesTranslator:
             self._msg_id = None
             return out
         if etype == "tool-input-start":
+            out = self._close_reasoning()
             call_id = obj.get("id", f"call_{uuid.uuid4().hex[:16]}")
             name = obj.get("toolName", "")
             idx = self.output_index
@@ -865,11 +883,12 @@ class ResponsesTranslator:
             self._current_tool = {"item_id": call_id, "call_id": call_id, "name": name,
                                   "arguments": "", "index": idx}
             self.tool_calls.append(self._current_tool)
-            return [("response.output_item.added", {
+            out.append(("response.output_item.added", {
                 "output_index": idx,
                 "item": {"id": call_id, "type": "function_call", "status": "in_progress",
                          "call_id": call_id, "name": name, "arguments": ""},
-            })]
+            }))
+            return out
         if etype == "tool-input-delta":
             if self._current_tool is None:
                 return []
@@ -1022,15 +1041,57 @@ class AnthropicTranslator:
 
     # -- main entry ----------------------------------------------------------
 
+    def _close_open_block(self):
+        """Finalize whatever block is currently open and return the events that
+        close it (a content_block_stop, possibly preceded by nothing).
+
+        The upstream interleaves events -- it sends `text-start` / `tool-input-start`
+        *before* `reasoning-end` -- so a new block can be opened while the previous
+        one is still open. Leaving a block unterminated makes client SDKs (Claude
+        Code) keep the block open and stall the turn, so every block must be
+        closed before the next one opens (or before the stream ends).
+        """
+        out = []
+        if self._block_type is None or self._block_index < 0:
+            return out
+        btype = self._block_type
+        if btype == "thinking":
+            self.blocks.append({"type": "thinking", "thinking": "".join(self.reasoning)})
+        elif btype == "text":
+            self.blocks.append({"type": "text", "text": "".join(self.text)})
+        elif btype == "tool_use" and self._tool is not None:
+            try:
+                parsed = json.loads(self._tool["input_raw"]) if self._tool["input_raw"] else {}
+            except ValueError:
+                parsed = {}
+            self.tool_calls.append({"id": self._tool["id"], "name": self._tool["name"],
+                                    "input": parsed})
+            self.blocks.append({"type": "tool_use", "id": self._tool["id"],
+                                "name": self._tool["name"], "input": parsed})
+            self._tool = None
+        out.append(self._block_stop())
+        self._block_type = None
+        return out
+
+    def _open_block(self, block):
+        """Close any open block, then open `block`; returns the open events."""
+        out = self._close_open_block()
+        out.append(self._block_start(block))
+        return out
+
+    def pending_block_stop(self):
+        """Events that close the block still open when the upstream ends early."""
+        return self._close_open_block()
+
     def on_event(self, obj):
         """Translate one native event; return a list of (event_type, data)."""
         etype = obj.get("type")
         out = []
         if etype == "reasoning-start":
-            out.append(self._block_start({"type": "thinking", "thinking": ""}))
+            out += self._open_block({"type": "thinking", "thinking": ""})
         elif etype == "reasoning-delta":
             if self._block_type != "thinking":
-                out.append(self._block_start({"type": "thinking", "thinking": ""}))
+                out += self._open_block({"type": "thinking", "thinking": ""})
             self.reasoning.append(obj.get("text", ""))
             out.append(("content_block_delta", {
                 "type": "content_block_delta", "index": self._block_index,
@@ -1038,14 +1099,12 @@ class AnthropicTranslator:
             }))
         elif etype == "reasoning-end":
             if self._block_type == "thinking":
-                self.blocks.append({"type": "thinking", "thinking": "".join(self.reasoning)})
-                out.append(self._block_stop())
-                self._block_type = None
+                out += self._close_open_block()
         elif etype == "text-start":
-            out.append(self._block_start({"type": "text", "text": ""}))
+            out += self._open_block({"type": "text", "text": ""})
         elif etype == "text-delta":
             if self._block_type != "text":
-                out.append(self._block_start({"type": "text", "text": ""}))
+                out += self._open_block({"type": "text", "text": ""})
             self.text.append(obj.get("text", ""))
             out.append(("content_block_delta", {
                 "type": "content_block_delta", "index": self._block_index,
@@ -1053,16 +1112,14 @@ class AnthropicTranslator:
             }))
         elif etype == "text-end":
             if self._block_type == "text":
-                self.blocks.append({"type": "text", "text": "".join(self.text)})
-                out.append(self._block_stop())
-                self._block_type = None
+                out += self._close_open_block()
         elif etype == "tool-input-start":
             call_id = obj.get("id", f"toolu_{uuid.uuid4().hex[:16]}")
             name = obj.get("toolName", "")
             self._tool = {"index": None, "id": call_id, "name": name, "input_raw": ""}
-            out.append(self._block_start({
+            out += self._open_block({
                 "type": "tool_use", "id": call_id, "name": name, "input": {},
-            }))
+            })
             self._tool["index"] = self._block_index
         elif etype == "tool-input-delta":
             if self._tool is not None:
@@ -1395,8 +1452,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 for event_type, data in translator.on_event(obj):
                     self._write_anthropic_event(event_type, data)
             # The upstream may end without a native 'finish' event; never leave
-            # the stream without terminal events.
+            # the stream without terminal events. Close any still-open block
+            # first, or the client keeps it open and the turn appears to pause.
             if not translator.completed:
+                for event_type, data in translator.pending_block_stop():
+                    self._write_anthropic_event(event_type, data)
                 self._write_anthropic_event("message_delta", {
                     "type": "message_delta",
                     "delta": {"stop_reason": "end_turn", "stop_sequence": None},
@@ -1514,7 +1574,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self._write_sse_event(event_type, data)
             # Upstream may end without a native 'finish' event; never leave the
             # client without a terminal event, or it reports a bare disconnect.
+            # Close any still-open reasoning item first, or the SDK keeps it
+            # in_progress and the response appears to stall.
             if not translator.completed:
+                for event_type, data in translator.pending_reasoning_stop():
+                    self._write_sse_event(event_type, data)
                 self._write_sse_event("response.completed",
                                       {"type": "response.completed",
                                        "response": translator.final_response(status="completed")})
