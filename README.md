@@ -27,7 +27,7 @@ Edit `.env` (same directory as `main.py`):
 | key               | description                                              |
 |-------------------|----------------------------------------------------------|
 | `base_url`        | command-code endpoint (defaults to `/alpha/generate`)    |
-| `auth_token`      | your command-code CLI key (`user_...`)                   |
+| `auth_token`      | command-code key; **highest-priority** upstream key — if set it is pinned and used for every request, overriding any client-supplied key. Leave empty to auto-discover (see below). |
 | `host`            | listen address (default `0.0.0.0`)                       |
 | `port`            | listen port (default `8080`)                             |
 | `default_model`   | model used when the client omits `model`                 |
@@ -36,6 +36,31 @@ Edit `.env` (same directory as `main.py`):
 | `memory` / `taste`| native request memory / taste strings (default empty)    |
 | `skills`          | native request skills (default empty → null)             |
 | `permission_mode` | native request `permissionMode` (default `standard`)     |
+
+### API key lookup
+
+The upstream command-code key is resolved per request in this priority order,
+stopping at the first source that yields a key:
+
+| # | source | notes |
+|---|--------|-------|
+| 1 | `.env` `auth_token` | **Pinned** — when set, it is used for every request and client-supplied keys are ignored. |
+| 2 | `COMMANDCODE_API_KEY` | Env var (also read from `.env`). |
+| 3 | `COMMANDCODE_API_KEYS` | Env var — comma/newline-separated **pool**, used round-robin. |
+| 4 | `~/.commandcode/auth.json` | |
+| 5 | `~/.pi/agent/auth.json` | pi-compatible. |
+| 6 | `~/.omp/agent/auth.json` | OMP-compatible. |
+| 7 | client-supplied key | Per-request passthrough — see below. Only used when nothing in 2–6 is set. |
+
+Each `auth.json` accepts three shapes: `{"apiKey": "user_..."}`,
+`{"commandcode": "user_..."}`, or `{"command-code": {"type": "api", "key": "user_..."}}`.
+
+**Client-key passthrough** lets each caller supply its own upstream key: the
+proxy reads it from the incoming request — `x-api-key` (Anthropic / Claude Code)
+or `Authorization: Bearer` (OpenAI) — and forwards it upstream, falling back to
+the server pool above when the caller sends no key. When `.env auth_token` is
+pinned it wins over client keys; otherwise a client-supplied key takes
+precedence over the `COMMANDCODE_API_KEY(S)` / `auth.json` pool.
 
 ### Model catalog (`models.py`)
 

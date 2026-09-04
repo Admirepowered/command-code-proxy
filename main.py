@@ -10,7 +10,9 @@ Run:  python main.py
 
 import json
 import os
+import re
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,13 +67,118 @@ def load_env(path):
     return env
 
 
+# CLI auth files checked, in order, when no higher-priority source yields a key.
+# Each may hold the key under "apiKey", "commandcode", or
+# {"command-code": {"type": "api", "key": "..."}}.
+AUTH_FILE_CANDIDATES = (
+    os.path.join("~", ".commandcode", "auth.json"),
+    os.path.join("~", ".pi", "agent", "auth.json"),
+    os.path.join("~", ".omp", "agent", "auth.json"),
+)
+
+
+def _read_auth_file(path):
+    """Extract a command-code key from one auth.json, trying the three accepted
+    shapes; return None on any miss, read error, or malformed JSON."""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for field in ("apiKey", "commandcode"):
+        val = data.get(field)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    cc = data.get("command-code")
+    if isinstance(cc, dict) and cc.get("type") == "api":
+        val = cc.get("key")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _split_keys(raw):
+    """Split a comma/newline-separated key list; trim, drop empties, and
+    de-duplicate while preserving order."""
+    if not raw:
+        return []
+    seen, out = set(), []
+    for k in re.split(r"[,\n]", raw):
+        k = k.strip()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def resolve_server_keys(env):
+    """Resolve the server-side upstream key(s) from the priority chain, stopping
+    at the first source that yields one:
+
+        .env auth_token  >  COMMANDCODE_API_KEY  >  COMMANDCODE_API_KEYS
+        >  ~/.commandcode/auth.json  >  ~/.pi/agent/auth.json  >  ~/.omp/...
+
+    The env vars are also honoured if written into the .env file. Returns
+    (keys, pinned, source): `pinned` is True only when the operator set
+    `.env auth_token`, which then beats any per-request client-passthrough key;
+    `source` is a label for logging.
+    """
+    token = (env.get("auth_token") or "").strip()
+    if token:
+        return [token], True, ".env auth_token"
+    single = (os.environ.get("COMMANDCODE_API_KEY")
+              or env.get("COMMANDCODE_API_KEY") or "").strip()
+    if single:
+        return [single], False, "COMMANDCODE_API_KEY"
+    pool = _split_keys(os.environ.get("COMMANDCODE_API_KEYS")
+                       or env.get("COMMANDCODE_API_KEYS"))
+    if pool:
+        return pool, False, "COMMANDCODE_API_KEYS"
+    for path in AUTH_FILE_CANDIDATES:
+        key = _read_auth_file(path)
+        if key:
+            return [key], False, path
+    return [], False, "none"
+
+
+class KeyPool:
+    """Thread-safe round-robin over one or more upstream keys. Returns '' when
+    empty so an unauthorized upstream reply is surfaced unchanged."""
+
+    def __init__(self, keys):
+        self._keys = [k for k in keys if k]
+        self._i = 0
+        self._lock = threading.Lock()
+
+    def next(self):
+        if not self._keys:
+            return ""
+        with self._lock:
+            key = self._keys[self._i % len(self._keys)]
+            self._i += 1
+            return key
+
+    def __len__(self):
+        return len(self._keys)
+
+
 def get_config():
     env = load_env(ENV_PATH)
     cfg = {}
     for key, default in DEFAULTS.items():
         cfg[key] = env.get(key, default) or default
-    if not cfg["auth_token"]:
-        print("[warn] auth_token missing from .env; upstream calls will be unauthorized",
+    keys, pinned, source = resolve_server_keys(env)
+    cfg["api_keys"] = keys
+    cfg["key_pinned"] = pinned
+    cfg["key_source"] = source
+    cfg["key_pool"] = KeyPool(keys)
+    # Back-compatible single-token view: the first key the pool would use.
+    cfg["auth_token"] = keys[0] if keys else ""
+    if not keys:
+        print("[warn] no server API key resolved (.env / env vars / auth.json); "
+              "requests without a client-supplied key will be unauthorized",
               file=sys.stderr)
     return cfg
 
@@ -1081,10 +1188,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def _upstream_post(self, native_body, cfg):
-        """POST to the command-code endpoint; on request failure reply 502."""
+    def _client_api_key(self):
+        """Extract a client-supplied upstream key from the incoming request.
+
+        Anthropic clients (Claude Code) send it as `x-api-key`; OpenAI clients
+        as `Authorization: Bearer <key>`. Returns None when the caller gave no
+        key, so the server pool can supply one instead.
+        """
+        xkey = (self.headers.get("x-api-key") or "").strip()
+        if xkey:
+            return xkey
+        auth = (self.headers.get("Authorization") or "").strip()
+        if auth[:7].lower() == "bearer " and auth[7:].strip():
+            return auth[7:].strip()
+        return None
+
+    def _upstream_post(self, native_body, cfg, client_key=None):
+        """POST to the command-code endpoint; on request failure reply 502.
+
+        The Bearer key is chosen per request: a pinned `.env auth_token` always
+        wins; otherwise a client-supplied key (x-api-key / Authorization) is
+        forwarded upstream; otherwise the next key in the round-robin pool.
+        """
+        if cfg.get("key_pinned"):
+            key = cfg["auth_token"]
+        else:
+            key = (client_key or "").strip() or cfg["key_pool"].next()
         headers = dict(UPSTREAM_HEADERS)
-        headers["Authorization"] = f"Bearer {cfg['auth_token']}"
+        headers["Authorization"] = f"Bearer {key}"
         try:
             return requests.post(
                 cfg["base_url"],
@@ -1157,7 +1288,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         native_body = convert_openai_request(openai_body, cfg)
         client_wants_stream = bool(openai_body.get("stream"))
 
-        resp = self._upstream_post(native_body, cfg)
+        resp = self._upstream_post(native_body, cfg, self._client_api_key())
         if resp is None or not self._upstream_ok(resp):
             return
 
@@ -1179,7 +1310,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         native_body = convert_responses_request(openai_body, cfg)
         client_wants_stream = bool(openai_body.get("stream"))
 
-        resp = self._upstream_post(native_body, cfg)
+        resp = self._upstream_post(native_body, cfg, self._client_api_key())
         if resp is None or not self._upstream_ok(resp):
             return
 
@@ -1227,7 +1358,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         native_body = convert_anthropic_request(body, cfg)
         client_wants_stream = bool(body.get("stream"))
 
-        resp = self._upstream_post(native_body, cfg)
+        resp = self._upstream_post(native_body, cfg, self._client_api_key())
         if resp is None:
             return
         # _upstream_post already replied on connection failure; _upstream_ok
@@ -1463,6 +1594,12 @@ def main():
     server.models = build_models()
     print(f"[command-code bridge] listening on http://{cfg['host']}:{cfg['port']}")
     print(f"[command-code bridge] upstream: {cfg['base_url']}")
+    if cfg["api_keys"]:
+        print(f"[command-code bridge] auth: {len(cfg['api_keys'])} key(s) from {cfg['key_source']}"
+              + (" [pinned: overrides client keys]" if cfg["key_pinned"] else
+                 " [client x-api-key / Authorization takes precedence]"))
+    else:
+        print("[command-code bridge] auth: no server key — relying on client-supplied keys")
     print(f"[command-code bridge] default model: {cfg['default_model']}")
     print(f"[command-code bridge] models catalog ({len(server.models)}): "
           + ", ".join(m["id"] for m in server.models))
