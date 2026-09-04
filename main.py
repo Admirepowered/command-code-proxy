@@ -1152,7 +1152,14 @@ class AnthropicTranslator:
             out.append(("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": self.usage["output_tokens"]},
+                # Send the full usage (input + cache counts included), not just
+                # output_tokens: the Anthropic protocol only carries input_tokens
+                # in message_start, but the upstream only reports them in its
+                # final event -- too late to amend message_start. Usage trackers
+                # (CC-Switch, Claude Code) accept a corrected full usage in the
+                # final message_delta, which is how a 0-input message_start gets
+                # the real count.
+                "usage": self.usage,
             }))
             out.append(("message_stop", {"type": "message_stop"}))
         return out
