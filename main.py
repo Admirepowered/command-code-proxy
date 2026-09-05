@@ -1144,7 +1144,14 @@ class AnthropicTranslator:
                 self._block_type = None
         elif etype == "finish":
             reason = obj.get("finishReason")
-            self.stop_reason = "tool_use" if map_finish_reason(reason) == "tool_calls" else "end_turn"
+            # If the upstream reported a non-tool finish reason but actually
+            # emitted tool_use blocks, the turn is still waiting on the client
+            # to run them -- reporting end_turn would make Claude Code mark the
+            # task done mid-flight.
+            if self.tool_calls and map_finish_reason(reason) != "tool_calls":
+                self.stop_reason = "tool_use"
+            else:
+                self.stop_reason = "tool_use" if map_finish_reason(reason) == "tool_calls" else "end_turn"
             if reason == "length":
                 self.stop_reason = "max_tokens"
             self.usage = self.anthropic_usage(obj.get("totalUsage") or {})
@@ -1458,18 +1465,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     continue
                 for event_type, data in translator.on_event(obj):
                     self._write_anthropic_event(event_type, data)
-            # The upstream may end without a native 'finish' event; never leave
-            # the stream without terminal events. Close any still-open block
-            # first, or the client keeps it open and the turn appears to pause.
+            # The upstream stream ended without a native 'finish' event. Normal
+            # upstream responses always end with one, so its absence means the
+            # response was cut off (dropped connection, upstream hiccup) --
+            # NOT a clean completion. Close any still-open block first, then
+            # surface an error. Masking it as stop_reason end_turn would make
+            # Claude Code mark the turn done mid-task with a partial result
+            # ("shows done, but the task has no result").
             if not translator.completed:
                 for event_type, data in translator.pending_block_stop():
                     self._write_anthropic_event(event_type, data)
-                self._write_anthropic_event("message_delta", {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": {"output_tokens": sum(len(t) for t in translator.text)},
+                self._write_anthropic_event("error", {
+                    "type": "error",
+                    "error": {"type": "api_error",
+                              "message": "upstream stream ended before a finish event (response truncated)"},
                 })
-                self._write_anthropic_event("message_stop", {"type": "message_stop"})
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
             pass  # client went away; stop pulling upstream (don't waste tokens)
@@ -1507,6 +1517,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._close_upstream(resp)
             self._anthropic_error(502, f"upstream stream failed: {exc}",
                                   err_type="api_error")
+            return
+        # A truncated upstream (no native 'finish') is not a completed turn;
+        # don't hand the client a 200 that looks finished.
+        if not translator.completed:
+            self._anthropic_error(502,
+                                  "upstream stream ended before a finish event "
+                                  "(response truncated)", err_type="api_error")
             return
         self._send_json(200, translator.final_message())
 
@@ -1579,16 +1596,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     continue
                 for event_type, data in translator.on_event(obj):
                     self._write_sse_event(event_type, data)
-            # Upstream may end without a native 'finish' event; never leave the
-            # client without a terminal event, or it reports a bare disconnect.
-            # Close any still-open reasoning item first, or the SDK keeps it
-            # in_progress and the response appears to stall.
+            # Upstream ended without a native 'finish' event -- that means the
+            # response was cut off, not completed. Close any still-open
+            # reasoning item, then report failure; a bare response.completed
+            # would make codex treat a truncated run as a finished task.
             if not translator.completed:
                 for event_type, data in translator.pending_reasoning_stop():
                     self._write_sse_event(event_type, data)
-                self._write_sse_event("response.completed",
-                                      {"type": "response.completed",
-                                       "response": translator.final_response(status="completed")})
+                self._write_sse_event("response.failed", {
+                    "type": "response.failed",
+                    "response": translator.final_response(status="failed"),
+                    "error": {"code": "upstream_error",
+                              "message": "upstream stream ended before a finish event (response truncated)"},
+                })
             # Close the connection so clients see EOF after response.completed.
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
@@ -1631,6 +1651,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 502, f"upstream stream failed: {exc}", code="upstream_error",
                 type_="upstream_error"))
             return
+        # No native finish event seen -> the upstream stream was cut off, not
+        # completed; don't hand the client a 200 that looks finished.
+        if translator.finish_reason is None:
+            self._send_json(502, error_envelope(
+                502, "upstream stream ended before a finish event (response truncated)",
+                code="upstream_error", type_="upstream_error"))
+            return
         self._send_json(200, translator.final_completion())
 
     def _buffer_responses(self, resp, translator):
@@ -1649,6 +1676,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_json(502, error_envelope(
                 502, f"upstream stream failed: {exc}", code="upstream_error",
                 type_="upstream_error"))
+            return
+        # No native finish event seen -> truncated, not completed.
+        if not translator.completed:
+            self._send_json(502, error_envelope(
+                502, "upstream stream ended before a finish event (response truncated)",
+                code="upstream_error", type_="upstream_error"))
             return
         self._send_json(200, translator.final_response(status="completed"))
 
