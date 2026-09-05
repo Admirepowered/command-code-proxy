@@ -7,3 +7,6 @@ __pycache__/
 
 # runtime logs
 _server*.log
+server.log
+server.err
+server.pid

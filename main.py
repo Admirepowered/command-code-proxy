@@ -51,6 +51,12 @@ UPSTREAM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
 }
 
+# How many times to re-POST before reporting an upstream failure. At POST time
+# nothing has been streamed to the client yet, and /alpha/generate is a fresh,
+# stateless generation per call, so a retry is a safe remedy for transient
+# timeouts / 5xx upstream hiccups.
+UPSTREAM_RETRIES = 3
+
 
 def load_env(path):
     """Minimal KEY=VALUE .env parser (no external dependency)."""
@@ -635,6 +641,7 @@ class Translator:
         self.finish_reason = None
         self.usage = None
         self._sent_role = False
+        self.upstream_error = None   # message from a native 'error' event, if any
 
     def _chunk(self, delta, finish_reason=None, usage=None):
         chunk = {
@@ -658,6 +665,9 @@ class Translator:
     def on_event(self, obj):
         """Translate one native event; return a list of OpenAI chunks to emit."""
         etype = obj.get("type")
+        if etype == "error":
+            self.upstream_error = upstream_error_message(obj) or "upstream error"
+            return []
         if etype == "reasoning-delta":
             self.reasoning.append(obj.get("text", ""))
             return [self._content_chunk({"reasoning_content": obj.get("text", "")})]
@@ -759,6 +769,7 @@ class ResponsesTranslator:
         self._msg_index = None
         self._current_tool = None
         self.completed = False   # True once a native 'finish' event is seen
+        self.upstream_error = None   # message from a native 'error' event, if any
 
     def meta_response(self, status="in_progress"):
         return {
@@ -805,6 +816,9 @@ class ResponsesTranslator:
     def on_event(self, obj):
         """Translate one native event; return a list of (event_type, data) pairs."""
         etype = obj.get("type")
+        if etype == "error":
+            self.upstream_error = upstream_error_message(obj) or "upstream error"
+            return []
         if etype == "reasoning-delta":
             self.reasoning.append(obj.get("text", ""))
             out = []
@@ -974,6 +988,7 @@ class AnthropicTranslator:
         self._block_type = None
         self._tool = None
         self.completed = False
+        self.upstream_error = None   # message from a native 'error' event, if any
 
     # -- event construction helpers ----------------------------------------
 
@@ -1087,6 +1102,9 @@ class AnthropicTranslator:
         """Translate one native event; return a list of (event_type, data)."""
         etype = obj.get("type")
         out = []
+        if etype == "error":
+            self.upstream_error = upstream_error_message(obj) or "upstream error"
+            return []
         if etype == "reasoning-start":
             out += self._open_block({"type": "thinking", "thinking": ""})
         elif etype == "reasoning-delta":
@@ -1204,6 +1222,27 @@ def error_envelope(status, message, code=None, type_="invalid_request_error"):
     return {"error": {"message": message, "type": type_, "code": code, "status": status}}
 
 
+def upstream_error_message(obj):
+    """Pull a human-readable message out of a native error event, if any.
+
+    The upstream may end a stream with an explicit {'type': 'error', ...}
+    event before closing; its message is the real reason (rate limit, model
+    hiccup, ...) and beats the generic 'stream ended without finish' text.
+    """
+    err = obj.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or err.get("code") or json.dumps(err, ensure_ascii=False)
+    if err:
+        return str(err)
+    return obj.get("message") or None
+
+
+def log_diag(prefix, **fields):
+    """One-line stderr diagnostic for stream-end / failure post-mortems."""
+    parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+    print(f"[{prefix}] {parts}", file=sys.stderr, flush=True)
+
+
 def upstream_error_envelope(upstream_error):
     """Translate the native {'success': false, 'error': {...}} shape to OpenAI's."""
     err = upstream_error.get("error", {}) if isinstance(upstream_error, dict) else {}
@@ -1275,11 +1314,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return None
 
     def _upstream_post(self, native_body, cfg, client_key=None):
-        """POST to the command-code endpoint; on request failure reply 502.
+        """POST to the command-code endpoint; retry transient failures.
 
         The Bearer key is chosen per request: a pinned `.env auth_token` always
         wins; otherwise a client-supplied key (x-api-key / Authorization) is
         forwarded upstream; otherwise the next key in the round-robin pool.
+
+        Nothing has been sent to the client yet at this stage, so a connect or
+        header-read timeout (exception) or a 5xx reply (overloaded / hiccup)
+        is retried with short backoff -- a fresh, stateless generation is a
+        safe retry. Auth/4xx replies are permanent and passed through unchanged.
         """
         if cfg.get("key_pinned"):
             key = cfg["auth_token"]
@@ -1287,19 +1331,39 @@ class BridgeHandler(BaseHTTPRequestHandler):
             key = (client_key or "").strip() or cfg["key_pool"].next()
         headers = dict(UPSTREAM_HEADERS)
         headers["Authorization"] = f"Bearer {key}"
-        try:
-            return requests.post(
-                cfg["base_url"],
-                json=native_body,
-                headers=headers,
-                stream=True,
-                timeout=(10, 600),
-            )
-        except requests.RequestException as exc:
-            self._send_json(502, error_envelope(
-                502, f"upstream request failed: {exc}", code="upstream_unreachable",
-                type_="upstream_error"))
-            return None
+        last_exc = None
+        last_resp = None
+        for attempt in range(1, UPSTREAM_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    cfg["base_url"],
+                    json=native_body,
+                    headers=headers,
+                    stream=True,
+                    timeout=(10, 600),
+                )
+            except requests.RequestException as exc:
+                last_exc = exc
+                resp = None
+            else:
+                last_resp = resp
+                # Permanent client/authorization errors surface as-is.
+                if resp.status_code < 500:
+                    return resp
+                # 5xx: retry unless this was the last attempt.
+                if attempt >= UPSTREAM_RETRIES:
+                    return resp
+                self._close_upstream(resp)
+            if attempt < UPSTREAM_RETRIES:
+                time.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
+        # All attempts failed on exceptions -> the upstream is unreachable.
+        log_diag("upstream:post-failed",
+                 exc=type(last_exc).__name__,
+                 detail=str(last_exc)[:300] if last_exc is not None else None)
+        self._send_json(502, error_envelope(
+            502, f"upstream request failed: {last_exc}", code="upstream_unreachable",
+            type_="upstream_error"))
+        return None
 
     def _upstream_ok(self, resp):
         """Return True if the upstream response is usable; else reply with an
@@ -1454,6 +1518,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _stream_anthropic(self, resp, translator):
         self._sse_headers()
+        t0 = time.time()
         try:
             self._write_anthropic_event(*translator._start_event())
             for line in iter_sse_lines(resp):
@@ -1473,17 +1538,28 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # Claude Code mark the turn done mid-task with a partial result
             # ("shows done, but the task has no result").
             if not translator.completed:
+                log_diag("anthropic:truncated",
+                         elapsed=f"{time.time() - t0:.1f}s",
+                         reasoning=len("".join(translator.reasoning)),
+                         text=len("".join(translator.text)),
+                         blocks=len(translator.blocks),
+                         tools=len(translator.tool_calls),
+                         upstream_error=translator.upstream_error)
                 for event_type, data in translator.pending_block_stop():
                     self._write_anthropic_event(event_type, data)
+                reason = (translator.upstream_error
+                          or "upstream stream ended before a finish event "
+                             "(response truncated)")
                 self._write_anthropic_event("error", {
                     "type": "error",
-                    "error": {"type": "api_error",
-                              "message": "upstream stream ended before a finish event (response truncated)"},
+                    "error": {"type": "api_error", "message": reason},
                 })
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
             pass  # client went away; stop pulling upstream (don't waste tokens)
         except requests.RequestException as exc:
+            log_diag("anthropic:stream-failed", exc=type(exc).__name__,
+                     detail=str(exc)[:300])
             try:
                 self._write_anthropic_event("error", {
                     "type": "error",
@@ -1521,9 +1597,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # A truncated upstream (no native 'finish') is not a completed turn;
         # don't hand the client a 200 that looks finished.
         if not translator.completed:
-            self._anthropic_error(502,
-                                  "upstream stream ended before a finish event "
-                                  "(response truncated)", err_type="api_error")
+            reason = (translator.upstream_error
+                      or "upstream stream ended before a finish event "
+                         "(response truncated)")
+            log_diag("anthropic-buffer:truncated",
+                     reasoning=len("".join(translator.reasoning)),
+                     text=len("".join(translator.text)),
+                     blocks=len(translator.blocks),
+                     tools=len(translator.tool_calls),
+                     upstream_error=translator.upstream_error)
+            self._anthropic_error(502, reason, err_type="api_error")
             return
         self._send_json(200, translator.final_message())
 
@@ -1560,6 +1643,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _stream_response(self, resp, translator):
         self._sse_headers()
+        t0 = time.time()
         try:
             for line in iter_sse_lines(resp):
                 if not line:
@@ -1570,16 +1654,42 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     continue
                 for chunk in translator.on_event(obj):
                     self._write_sse(chunk)
-            self._write_sse(None)  # data: [DONE]
+            # A stream that ended without a native 'finish' event was cut off,
+            # not completed. Sending [DONE] would make chat clients treat a
+            # truncated run as a finished task -- the same masking bug as the
+            # Anthropic path. Surface an error chunk instead.
+            if translator.finish_reason is None:
+                reason = (translator.upstream_error
+                          or "upstream stream ended before a finish event "
+                             "(response truncated)")
+                log_diag("chat:truncated",
+                         elapsed=f"{time.time() - t0:.1f}s",
+                         reasoning=len("".join(translator.reasoning)),
+                         text=len("".join(translator.text)),
+                         tools=len(translator.tool_calls),
+                         upstream_error=translator.upstream_error)
+                self._write_sse({"error": {"message": reason, "type": "upstream_error",
+                                           "code": "upstream_error"}})
+            else:
+                self._write_sse(None)  # data: [DONE]
             # Close the connection so clients (curl -N, HTTP/1.1) see EOF.
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
             pass  # client went away; stop pulling upstream (don't waste tokens)
+        except requests.RequestException as exc:
+            log_diag("chat:stream-failed", exc=type(exc).__name__,
+                     detail=str(exc)[:300])
+            try:
+                self._write_sse({"error": {"message": str(exc), "type": "upstream_error",
+                                           "code": "upstream_error"}})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         finally:
             self._close_upstream(resp)
 
     def _stream_responses(self, resp, translator):
         self._sse_headers()
+        t0 = time.time()
         try:
             self._write_sse_event("response.created",
                                   {"type": "response.created",
@@ -1601,13 +1711,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # reasoning item, then report failure; a bare response.completed
             # would make codex treat a truncated run as a finished task.
             if not translator.completed:
+                log_diag("responses:truncated",
+                         elapsed=f"{time.time() - t0:.1f}s",
+                         reasoning=len("".join(translator.reasoning)),
+                         text=len("".join(translator.text)),
+                         tools=len(translator.tool_calls),
+                         upstream_error=translator.upstream_error)
                 for event_type, data in translator.pending_reasoning_stop():
                     self._write_sse_event(event_type, data)
+                reason = (translator.upstream_error
+                          or "upstream stream ended before a finish event "
+                             "(response truncated)")
                 self._write_sse_event("response.failed", {
                     "type": "response.failed",
                     "response": translator.final_response(status="failed"),
-                    "error": {"code": "upstream_error",
-                              "message": "upstream stream ended before a finish event (response truncated)"},
+                    "error": {"code": "upstream_error", "message": reason},
                 })
             # Close the connection so clients see EOF after response.completed.
             self.close_connection = True
@@ -1654,9 +1772,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # No native finish event seen -> the upstream stream was cut off, not
         # completed; don't hand the client a 200 that looks finished.
         if translator.finish_reason is None:
+            reason = (translator.upstream_error
+                      or "upstream stream ended before a finish event "
+                         "(response truncated)")
+            log_diag("chat-buffer:truncated",
+                     reasoning=len("".join(translator.reasoning)),
+                     text=len("".join(translator.text)),
+                     tools=len(translator.tool_calls),
+                     upstream_error=translator.upstream_error)
             self._send_json(502, error_envelope(
-                502, "upstream stream ended before a finish event (response truncated)",
-                code="upstream_error", type_="upstream_error"))
+                502, reason, code="upstream_error", type_="upstream_error"))
             return
         self._send_json(200, translator.final_completion())
 
@@ -1679,9 +1804,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         # No native finish event seen -> truncated, not completed.
         if not translator.completed:
+            reason = (translator.upstream_error
+                      or "upstream stream ended before a finish event "
+                         "(response truncated)")
+            log_diag("responses-buffer:truncated",
+                     reasoning=len("".join(translator.reasoning)),
+                     text=len("".join(translator.text)),
+                     tools=len(translator.tool_calls),
+                     upstream_error=translator.upstream_error)
             self._send_json(502, error_envelope(
-                502, "upstream stream ended before a finish event (response truncated)",
-                code="upstream_error", type_="upstream_error"))
+                502, reason, code="upstream_error", type_="upstream_error"))
             return
         self._send_json(200, translator.final_response(status="completed"))
 
