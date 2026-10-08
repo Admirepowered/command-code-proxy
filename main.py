@@ -5,13 +5,17 @@ top of the command-code native /alpha/generate API.
     client (OpenAI JSON)  ──▶  this proxy  ──▶  /alpha/generate   (native NDJSON)
     GET /v1/models        ──▶  https://api.commandcode.ai/provider/v1/models
 
-The native endpoint is text-only and stream-only. Three quirks shape everything
-below:
+A Python port of c0mmandc0de2api (TypeScript), plus outbound HTTP proxy support
+and a live model catalog. The native protocol has several quirks that shape
+everything below; all of them were verified against the live endpoint:
 
-  * `messages[].content` must be a **plain string** — structured content blocks
-    are rejected with a schema error, so tool results and prior tool calls are
-    flattened into text.
-  * The system prompt travels in its own `params.system` field, not as a message.
+  * Messages follow a role-discriminated schema — NOT the OpenAI shape. An
+    assistant turn is `content: [text|reasoning|tool-call]` blocks, a tool
+    result is a `role:"tool"` message with `content: [tool-result]` blocks, and
+    a user turn must be a plain string (a tool-result block in a user message is
+    rejected outright). The upstream normalizes all of this back into the OpenAI
+    shape internally, so the round-trip preserves real tool structure.
+  * The system prompt travels in its own `params.system` field.
   * Responses arrive as newline-delimited JSON events (not `data:` SSE frames),
     always with `stream: true` — a non-streaming request is refused upstream, so
     non-streaming callers get a buffered single-object response instead.
@@ -22,7 +26,10 @@ Single file, stdlib + `requests`.   Run:  python main.py
 import hmac
 import json
 import os
+import random
 import re
+import string
+import subprocess
 import sys
 import threading
 import time
@@ -58,29 +65,75 @@ DEFAULTS = {
     "default_model": "deepseek/deepseek-v4-flash",
     "models": "",  # optional comma-separated filter/order for GET /v1/models
     "models_ttl": "300",  # seconds the upstream model list is cached
-    # native request envelope (see build_native_body)
-    "working_dir": "/tmp",
-    "environment": "terminal",
+    # OAuth (used only when no key can be found anywhere)
+    "auth_timeout": "15000",  # ms to wait for the browser callback, as in the CLI
+    # native request envelope
+    "working_dir": "",  # empty -> a random fake CLI-looking path (see below)
+    "environment": "",  # empty -> a fake Node CLI fingerprint
     "memory": "",
     "taste": "",
     "skills": "",
     "permission_mode": "standard",
 }
 
-# The CLI's own headers. Verified against the live endpoint: the version header
-# selects the event vocabulary, 0.38.2 is the shape handled by Translator.
+# The CLI's own headers. The version header selects the event vocabulary —
+# 0.38.2 is the shape handled by Translator.
+CLI_VERSION = "0.38.2"
 UPSTREAM_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "text/event-stream",
-    "x-command-code-version": "0.38.2",
+    "x-command-code-version": CLI_VERSION,
     "x-cli-environment": "production",
+    "x-taste-learning": "true",
+    "x-co-flag": "false",
 }
 
 MAX_OUTPUT_TOKENS = 200_000
 MAX_ATTEMPTS = 3
+RETRY_DELAY = 0.2  # seconds; doubles per attempt, as in the CLI
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+HARD_LIMIT_COOLDOWN = 300.0  # seconds to stop calling upstream once every key is limited
 
 SESSION = requests.Session()
+
+# ---------------------------------------------------------------------------
+# CLI disguise
+#
+# The upstream fingerprints clients. A fixed deployment path and a bare
+# "terminal" environment string are not what a real CLI session looks like, so
+# the working directory is randomized once per process (stable for the process
+# lifetime — a real user keeps working in one directory — and different after a
+# restart, so no cross-restart fingerprint forms).
+# ---------------------------------------------------------------------------
+
+
+def _random_lower(n):
+    return "".join(random.choice(string.ascii_lowercase) for _ in range(n))
+
+
+def generate_fake_working_dir():
+    prefix = random.choice(("/Users/", "/home/"))
+    subdir = random.choice(("projects", "dev", "code", "work", "src"))
+    return (f"{prefix}{_random_lower(random.randint(5, 8))}/"
+            f"{subdir}/{_random_lower(random.randint(4, 8))}")
+
+
+def project_slug_from_path(path):
+    """Mirrors the CLI's x-project-slug derivation: lowercase, drop the drive
+    letter, non-alphanumerics to '-', trim dashes. The drive letter must go
+    first — substituting first would turn "C:" into "c-" and keep the "c"."""
+    slug = re.sub(r"^[a-z]:", "", path.lower())
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-") or "project"
+
+
+FAKE_WORKING_DIR = generate_fake_working_dir()
+FAKE_ENVIRONMENT = "linux-x64, Node.js v20.11.0"
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
 
 
 def load_env(path):
@@ -97,6 +150,52 @@ def load_env(path):
     except OSError:
         pass
     return env
+
+
+def parse_proxy(raw):
+    """A single proxy URL applies to both schemes. Empty returns None so that
+    requests falls back to the standard HTTP_PROXY / HTTPS_PROXY variables."""
+    raw = (raw or "").strip()
+    return {"http": raw, "https": raw} if raw else None
+
+
+def derive_models_url(base_url):
+    parts = urllib.parse.urlsplit(base_url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}/provider/v1/models"
+    return "https://api.commandcode.ai/provider/v1/models"
+
+
+def load_config():
+    file_env = load_env(ENV_PATH)
+    cfg = {}
+    for key, default in DEFAULTS.items():
+        value = os.environ.get(key.upper())
+        if value is None:
+            value = file_env.get(key)
+        cfg[key] = default if value in (None, "") else value
+    cfg["port"] = int(cfg["port"])
+    cfg["models_ttl"] = max(0, int(cfg["models_ttl"]))
+    cfg["auth_timeout"] = max(0, int(cfg["auth_timeout"])) / 1000.0
+    cfg["connect_timeout"] = float(cfg["connect_timeout"])
+    cfg["read_timeout"] = float(cfg["read_timeout"])
+    cfg["proxies"] = parse_proxy(cfg["proxy"])
+    cfg["models_url"] = cfg["models_url"] or derive_models_url(cfg["base_url"])
+    cfg["debug"] = str(cfg["debug"]).lower() in ("1", "true", "yes", "on") or \
+        str(os.environ.get("DEBUG", "")).lower() in ("1", "true", "yes", "on")
+    cfg["working_dir"] = cfg["working_dir"] or FAKE_WORKING_DIR
+    cfg["environment"] = cfg["environment"] or FAKE_ENVIRONMENT
+    cfg["project_slug"] = project_slug_from_path(cfg["working_dir"])
+    cfg["file_env"] = file_env
+    refresh_keys(cfg)
+    return cfg
+
+
+def debug(cfg, *parts):
+    if cfg["debug"]:
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] "
+                         + " ".join(str(p) for p in parts) + "\n")
+        sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +271,10 @@ def resolve_server_keys(file_env):
     return [], False, "none"
 
 
+def mask(key):
+    return key if len(key) <= 12 else f"{key[:8]}…{key[-4:]}"
+
+
 class KeyPool:
     """Thread-safe round-robin over the server-side keys."""
 
@@ -192,8 +295,11 @@ class KeyPool:
         return len(self._keys)
 
 
-def mask(key):
-    return key if len(key) <= 12 else f"{key[:8]}…{key[-4:]}"
+def refresh_keys(cfg):
+    keys, pinned, source = resolve_server_keys(cfg.get("file_env", {}))
+    cfg["api_keys"], cfg["key_pinned"], cfg["key_source"] = keys, pinned, source
+    cfg["key_pool"] = KeyPool(keys)
+    return keys
 
 
 def client_key_from_headers(headers):
@@ -217,55 +323,297 @@ def pick_upstream_key(cfg, client_key=""):
     return cfg["key_pool"].next()
 
 
-def parse_proxy(raw):
-    """A single proxy URL applies to both schemes. Empty returns None so that
-    requests falls back to the standard HTTP_PROXY / HTTPS_PROXY variables."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    return {"http": raw, "https": raw}
+def sanitize_error_text(cfg, text):
+    """Upstream errors sometimes echo the request back. Never let a key reach
+    the client in the clear."""
+    for key in cfg["api_keys"]:
+        if len(key) > 8 and key in text:
+            text = text.replace(key, mask(key))
+    return text
 
 
-def derive_models_url(base_url):
-    parts = urllib.parse.urlsplit(base_url)
-    if parts.scheme and parts.netloc:
-        return f"{parts.scheme}://{parts.netloc}/provider/v1/models"
-    return "https://api.commandcode.ai/provider/v1/models"
+# ---------------------------------------------------------------------------
+# OAuth browser login
+#
+# Ported from the CLI: a throwaway local server receives the key the Studio
+# website POSTs back after the user authenticates, with a state token checked
+# against CSRF. Falls back to a terminal paste if the browser round-trip fails.
+# ---------------------------------------------------------------------------
+
+STUDIO_BASE_URL = "https://commandcode.ai"
+AUTH_PORT = 5959
+AUTH_PORT_RANGE = 10
 
 
-def load_config():
-    file_env = load_env(ENV_PATH)
-    cfg = {}
-    for key, default in DEFAULTS.items():
-        value = os.environ.get(key.upper())
-        if value is None:
-            value = file_env.get(key)
-        cfg[key] = default if value in (None, "") else value
-    cfg["port"] = int(cfg["port"])
-    cfg["models_ttl"] = max(0, int(cfg["models_ttl"]))
-    cfg["connect_timeout"] = float(cfg["connect_timeout"])
-    cfg["read_timeout"] = float(cfg["read_timeout"])
-    cfg["proxies"] = parse_proxy(cfg["proxy"])
-    cfg["models_url"] = cfg["models_url"] or derive_models_url(cfg["base_url"])
-    cfg["debug"] = str(cfg["debug"]).lower() in ("1", "true", "yes", "on") or \
-        str(os.environ.get("DEBUG", "")).lower() in ("1", "true", "yes", "on")
-    keys, pinned, source = resolve_server_keys(file_env)
-    cfg["api_keys"], cfg["key_pinned"], cfg["key_source"] = keys, pinned, source
-    cfg["key_pool"] = KeyPool(keys)
-    return cfg
+class AuthTimeout(Exception):
+    pass
 
 
-def debug(cfg, *parts):
-    if cfg["debug"]:
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] " + " ".join(str(p) for p in parts) + "\n")
-        sys.stderr.flush()
+class CallbackHolder:
+    def __init__(self):
+        self.event = threading.Event()
+        self.value = None
+        self.error = None
+
+    def resolve(self, value):
+        self.value = value
+        self.event.set()
+
+    def reject(self, error):
+        self.error = error
+        self.event.set()
+
+    def wait(self, timeout):
+        if not self.event.wait(timeout):
+            raise AuthTimeout()
+        if self.error:
+            raise self.error
+        return self.value
 
 
-def upstream_headers(key):
-    headers = dict(UPSTREAM_HEADERS)
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    return headers
+class AuthCallbackHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "command-code-bridge-auth/1.0"
+    holder = None
+
+    def log_message(self, *args):
+        pass
+
+    def _cors(self):
+        origin = self.headers.get("Origin") or ""
+        allowed = ("http://localhost:3000", "https://staging.commandcode.ai",
+                   "https://commandcode.ai")
+        self.send_header("Access-Control-Allow-Origin",
+                         origin if origin in allowed else allowed[0])
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        requested = self.headers.get("Access-Control-Request-Headers")
+        self.send_header("Access-Control-Allow-Headers",
+                         requested if requested else "Content-Type")
+        # Chrome Private Network Access preflight
+        self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Content-Type", "application/json")
+
+    def _reply(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self._cors()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))[:10_000]
+        if urllib.parse.urlsplit(self.path).path != "/callback":
+            self._reply(404, {"success": False, "error": "Not found"})
+            return
+        try:
+            parsed = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, ValueError):
+            self._reply(400, {"success": False, "error": "Invalid JSON"})
+            return
+        if not isinstance(parsed, dict):
+            self._reply(400, {"success": False, "error": "Invalid JSON"})
+            return
+
+        if parsed.get("error"):
+            description = parsed.get("error_description") or str(parsed["error"])
+            self._reply(200, {"success": True})
+            self.holder.reject(ValueError(description))
+            return
+
+        fields = {name: (parsed.get(name) if isinstance(parsed.get(name), str) else "")
+                  for name in ("apiKey", "state", "userId", "userName", "keyName")}
+        if not all(fields.values()):
+            self._reply(400, {"success": False, "error": "Missing required fields"})
+            return
+
+        # Reply before resolving: the login flow closes the server as soon as
+        # the callback lands, which would cut off an unwritten response.
+        self._reply(200, {"success": True})
+        self.holder.resolve(fields)
+
+
+def _bind_auth_server(start_port=AUTH_PORT, port_range=AUTH_PORT_RANGE):
+    """Prefer the CLI's usual port, then the next few, then any free one."""
+    last = None
+    for offset in range(port_range + 1):
+        port = start_port + offset if offset < port_range else 0
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", port), AuthCallbackHandler)
+        except OSError as exc:
+            last = exc
+    raise OSError(f"could not bind an auth callback port: {last}")
+
+
+def open_browser(url):
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", url])
+        elif sys.platform.startswith("win"):
+            os.startfile(url)  # noqa: S606 — Windows shell open
+        else:
+            subprocess.Popen(["xdg-open", url])
+    except Exception:
+        print(f"   无法自动打开浏览器，请手动访问：{url}")
+
+
+def sanitize_api_key(raw):
+    """Strip bracketed-paste markers and control characters left by a terminal
+    paste."""
+    text = str(raw)
+    for marker in ("\x1b[200~", "\x1b[201~", "[200~", "[201~"):
+        text = text.replace(marker, "")
+    return "".join(ch for ch in text if ord(ch) > 31 and ord(ch) != 127).strip()
+
+
+def save_api_key(api_key):
+    directory = os.path.expanduser("~/.commandcode")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, "auth.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"apiKey": api_key}, fh, indent=2)
+        print(f"   API Key 已保存到 {path}")
+    except OSError as exc:
+        print(f"   [warn] 无法保存 API Key 到 {directory}: {exc}")
+
+
+def prompt_for_api_key(message):
+    """Interactive paste. A pasted auth.json blob is unwrapped to its key."""
+    try:
+        answer = input(f"{message}\n> ")
+    except (EOFError, KeyboardInterrupt):
+        return ""
+    try:
+        parsed = json.loads(answer.strip())
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("apiKey"), str):
+                answer = parsed["apiKey"]
+            elif isinstance(parsed.get("command-code"), dict):
+                answer = parsed["command-code"].get("key", answer)
+            elif isinstance(parsed.get("key"), str):
+                answer = parsed["key"]
+        elif isinstance(parsed, str):
+            answer = parsed
+    except ValueError:
+        pass
+    return sanitize_api_key(answer)
+
+
+def login(cfg):
+    """Full OAuth flow; returns the API key and saves it to auth.json."""
+    print("\n   开始 CommandCode OAuth 登录...")
+
+    holder = CallbackHolder()
+    AuthCallbackHandler.holder = holder
+    try:
+        server = _bind_auth_server()
+    except OSError:
+        print("   无法启动本地认证服务器，请手动粘贴 API Key。")
+        key = prompt_for_api_key("请粘贴你的 CommandCode API Key")
+        if not key:
+            raise RuntimeError("未提供 CommandCode API Key")
+        save_api_key(key)
+        return key
+
+    state = uuid.uuid4().hex + uuid.uuid4().hex
+    callback_url = f"http://localhost:{server.server_address[1]}/callback"
+    auth_url = (f"{STUDIO_BASE_URL}/studio/auth/cli"
+                f"?callback={urllib.parse.quote(callback_url, safe='')}"
+                f"&state={urllib.parse.quote(state, safe='')}")
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print("   正在打开浏览器...")
+    open_browser(auth_url)
+
+    timed_out = False
+    try:
+        callback = holder.wait(cfg["auth_timeout"])
+    except AuthTimeout:
+        callback, timed_out = None, True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    if timed_out:
+        print("   自动回传超时，请手动粘贴 API Key。")
+        key = prompt_for_api_key("自动回传失败。请在浏览器中复制 API Key 并粘贴到此处")
+        if not key:
+            raise RuntimeError("未提供 CommandCode API Key")
+        save_api_key(key)
+        return key
+
+    if callback["state"] != state:
+        raise RuntimeError("State token 不匹配，认证可能被篡改")
+
+    print(f"   认证成功！用户: {callback['userName']} ({callback['keyName']})")
+    save_api_key(callback["apiKey"])
+    return callback["apiKey"]
+
+
+def ensure_api_keys(cfg):
+    """Load keys, falling back to the OAuth flow when there are none."""
+    keys = refresh_keys(cfg)
+    if keys:
+        return keys
+    try:
+        key = login(cfg)
+    except Exception as exc:
+        print(f"❌ OAuth 登录失败: {exc}", file=sys.stderr)
+        print("   请手动配置 API Key：", file=sys.stderr)
+        print("   方式1: 设置环境变量 COMMANDCODE_API_KEY=user_...", file=sys.stderr)
+        print("   方式2: 设置环境变量 COMMANDCODE_API_KEYS=key1,key2,...", file=sys.stderr)
+        print('   方式3: 创建 ~/.commandcode/auth.json 包含 {"apiKey":"user_..."}',
+              file=sys.stderr)
+        raise SystemExit(1)
+    if not refresh_keys(cfg):
+        cfg["api_keys"] = [key]
+        cfg["key_pool"] = KeyPool([key])
+    return cfg["api_keys"]
+
+
+# ---------------------------------------------------------------------------
+# Hard-limit cooldown
+#
+# Once every key in the pool has come back hard-limited, stop hammering the
+# upstream and answer 429 locally until the window passes.
+# ---------------------------------------------------------------------------
+
+_hard_limit_until = 0.0
+_hard_limit_lock = threading.Lock()
+
+
+def in_hard_limit_cooldown():
+    return time.time() < _hard_limit_until
+
+
+def enter_hard_limit_cooldown():
+    global _hard_limit_until
+    with _hard_limit_lock:
+        _hard_limit_until = time.time() + HARD_LIMIT_COOLDOWN
+
+
+def cooldown_remaining():
+    return max(0.0, _hard_limit_until - time.time())
+
+
+def is_rate_limit_or_quota(text):
+    """Whether an upstream error should send the retry to a different key."""
+    return bool(
+        re.search(r"\b429\b", text)
+        or re.search(r"RATE.?LIMITED", text, re.I)
+        or re.search(r"MODEL.?NOT.?IN.?PLAN", text, re.I)
+        or re.search(r"usage\s*limit", text, re.I)
+        or re.search(r"quota", text, re.I)
+        or (re.search(r"\b403\b", text) and re.search(r"billing|plan|quota", text, re.I))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -347,9 +695,9 @@ def get_models(cfg):
 
 
 def parts_to_text(parts):
-    """Flatten an OpenAI content-parts array into plain text. The native
-    endpoint is text-only, so images and files become inline placeholders
-    instead of being dropped silently."""
+    """Flatten an OpenAI content-parts array into plain text. A user turn must
+    be a string upstream, so images and files become inline placeholders rather
+    than being dropped silently."""
     out = []
     for part in parts or []:
         if isinstance(part, str):
@@ -367,19 +715,43 @@ def parts_to_text(parts):
     return "\n".join(t for t in out if t)
 
 
-def tool_args(raw):
-    return raw if isinstance(raw, str) else json.dumps(raw or {}, ensure_ascii=False)
+def parse_tool_arguments(raw):
+    """Tool arguments travel as a JSON string; the native shape wants the parsed
+    object, so an unparseable string is passed through as-is."""
+    if isinstance(raw, (dict, list)):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
 
 
 def convert_messages(messages):
     """Split OpenAI messages into (native messages, system prompt).
 
-    The native API accepts only user/assistant roles with string content, so
-    system/developer messages are merged into `params.system`, tool messages
-    become "[tool result for <id>]" user turns, and assistant tool calls are
-    kept as an inline marker so the model sees its own prior actions.
+    The native schema is role-discriminated, so each turn is rebuilt in the
+    shape that role accepts:
+
+        user       -> string content
+        assistant  -> [text | reasoning | tool-call] blocks
+        tool       -> [tool-result] blocks, carrying tool_call_id
+
+    Tool structure is preserved end to end — the upstream normalizes these
+    blocks into the standard OpenAI `tool_calls` / `tool_call_id` fields itself,
+    so an agentic client gets a real tool round-trip rather than flattened text.
     """
     native, system_parts = [], []
+    # tool_call_id -> tool name, so a tool result can name the call it answers
+    tool_names = {}
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, dict) and call.get("id"):
+                    fn = call.get("function") or {}
+                    tool_names[call["id"]] = fn.get("name", "") if isinstance(fn, dict) else ""
+
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
@@ -388,30 +760,50 @@ def convert_messages(messages):
         if role in ("system", "developer"):
             system_parts.append(content if isinstance(content, str) else parts_to_text(content))
             continue
+
         if role == "tool":
             text = content if isinstance(content, str) else parts_to_text(content)
-            native.append({
-                "role": "user",
-                "content": f"[tool result for {msg.get('tool_call_id') or '?'}]\n{text}",
-            })
-            continue
-        if role not in ("user", "assistant"):
+            call_id = msg.get("tool_call_id") or ""
+            native.append({"role": "tool", "content": [{
+                "type": "tool-result",
+                "toolCallId": call_id,
+                "toolName": tool_names.get(call_id, ""),
+                "output": {"type": "text", "value": text},
+            }]})
             continue
 
-        if isinstance(content, list):
-            text = parts_to_text(content)
-        elif isinstance(content, str):
-            text = content
-        else:
-            text = ""
-        if role == "assistant" and msg.get("tool_calls"):
-            markers = [
-                f"[called tool {tc.get('function', {}).get('name', '?')}"
-                f"({tool_args(tc.get('function', {}).get('arguments'))})]"
-                for tc in msg["tool_calls"] if isinstance(tc, dict)
-            ]
-            text = "\n".join([text] + markers) if text else "\n".join(markers)
-        native.append({"role": role, "content": text})
+        if role == "assistant":
+            blocks = []
+            if isinstance(content, str) and content:
+                blocks.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                text = parts_to_text(content)
+                if text:
+                    blocks.append({"type": "text", "text": text})
+            if msg.get("reasoning_content"):
+                blocks.append({"type": "reasoning", "text": msg["reasoning_content"]})
+            for call in msg.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                fn = call.get("function") or {}
+                blocks.append({
+                    "type": "tool-call",
+                    "toolCallId": call.get("id") or "",
+                    "toolName": fn.get("name", "") if isinstance(fn, dict) else "",
+                    "input": parse_tool_arguments(fn.get("arguments") if isinstance(fn, dict) else None),
+                })
+            native.append({"role": "assistant",
+                           "content": blocks or [{"type": "text", "text": ""}]})
+            continue
+
+        if role == "user":
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = parts_to_text(content)
+            else:
+                text = ""
+            native.append({"role": "user", "content": text})
 
     system = "\n\n".join(p for p in system_parts if p)
     return native, system
@@ -457,9 +849,9 @@ def build_native_body(params, cfg):
         params["max_tokens"] = min(int(params["max_tokens"]), MAX_OUTPUT_TOKENS)
     return {
         "config": {
-            "workingDir": cfg["working_dir"] or "/tmp",
+            "workingDir": cfg["working_dir"],
             "date": time.strftime("%Y-%m-%d"),
-            "environment": cfg["environment"] or "terminal",
+            "environment": cfg["environment"],
             "structure": [],
             "isGitRepo": False,
             "currentBranch": "",
@@ -467,11 +859,13 @@ def build_native_body(params, cfg):
             "gitStatus": "",
             "recentCommits": [],
         },
-        "memory": cfg["memory"],
-        "taste": cfg["taste"],
+        "memory": cfg["memory"] or None,
+        "taste": cfg["taste"] or None,
         "skills": cfg["skills"] or None,
         "permissionMode": cfg["permission_mode"] or "standard",
         "params": params,
+        # Reused across retries so a resumed generation keeps its context.
+        "threadId": str(uuid.uuid4()),
     }
 
 
@@ -575,7 +969,8 @@ class Translator:
     """Consumes native events and emits OpenAI chunks.
 
     Streaming callers get one chunk per event; buffered callers get nothing
-    until `completion()`. Both paths share the accumulated state.
+    until `completion()`. Both paths share the accumulated state, which is what
+    lets a resumed stream continue the same assistant message.
 
     Events seen in practice: start / start-step / provider-metadata (ignored),
     text-start|delta|end, reasoning-start|delta|end, tool-input-start|delta|end,
@@ -692,7 +1087,8 @@ class Translator:
         call_id = event.get("toolCallId") or event.get("id") or ""
         name = event.get("toolName") or ""
         raw = event.get("input", event.get("args", event.get("arguments")))
-        args = tool_args(raw)
+        args = raw if isinstance(raw, str) else json.dumps(raw if raw is not None else {},
+                                                          ensure_ascii=False)
         index = self._by_id.get(call_id)
         if index is not None:
             call = self.tool_calls[index]
@@ -921,6 +1317,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_error(400, "Missing required field: messages")
             return
 
+        # Every key is hard-limited: answer locally instead of hammering upstream.
+        if in_hard_limit_cooldown():
+            retry_after = int(cooldown_remaining()) + 1
+            self.send_response(429)
+            self.send_header("Retry-After", str(retry_after))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            payload = json.dumps({"error": {
+                "message": f"上游限流冷却中，{retry_after}s 后重试",
+                "type": "rate_limit_error",
+            }}, ensure_ascii=False).encode("utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         streaming = req.get("stream") is True
         model = req.get("model") or self.cfg["default_model"]
         try:
@@ -931,84 +1343,212 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         debug(self.cfg, f"[chat] model={model} stream={streaming} "
                         f"messages={len(native['params']['messages'])} "
-                        f"tools={len(native['params'].get('tools', []))}")
+                        f"tools={len(native['params'].get('tools', []))} "
+                        f"threadId={native['threadId']}")
 
         client_key = client_key_from_headers(self.headers)
+        if streaming:
+            self._stream(native, model, client_key)
+        else:
+            self._buffered(native, model, client_key)
+
+    # -- upstream plumbing -------------------------------------------------
+
+    def _post(self, native, key):
+        headers = dict(UPSTREAM_HEADERS)
+        headers["x-project-slug"] = self.cfg["project_slug"]
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return SESSION.post(
+            self.cfg["base_url"],
+            json=native,
+            headers=headers,
+            stream=True,
+            timeout=(self.cfg["connect_timeout"], self.cfg["read_timeout"]),
+            proxies=self.cfg["proxies"],
+        )
+
+    def _handle_upstream_failure(self, cfg, status, detail, attempt, can_retry):
+        """Decide whether to rotate keys and retry. Returns True to continue."""
+        if is_rate_limit_or_quota(detail) and attempt >= len(cfg["key_pool"]) and \
+                re.search(r"Your limit resets at", detail):
+            enter_hard_limit_cooldown()
+            print(f"[bridge] 所有 {len(cfg['key_pool'])} 个 key 均触发硬限流，"
+                  f"进入 {int(HARD_LIMIT_COOLDOWN)}s 冷却", file=sys.stderr)
+            return False
+        if status in RETRY_STATUS and can_retry:
+            debug(cfg, f"[chat] HTTP {status}，换 key 重试")
+            return True
+        return False
+
+    # -- streaming ---------------------------------------------------------
+
+    def _stream(self, native, model, client_key):
+        cfg = self.cfg
+        translator = Translator(model, streaming=True)
+        opened = False
+        attempt = 0
         last_error = None
 
-        for attempt in range(MAX_ATTEMPTS):
-            if attempt:
-                time.sleep(0.5 * (2 ** (attempt - 1)))
-            key = pick_upstream_key(self.cfg, client_key)
-            debug(self.cfg, f"[chat] attempt {attempt + 1}/{MAX_ATTEMPTS} key={mask(key) or '(none)'}")
-            try:
-                resp = SESSION.post(
-                    self.cfg["base_url"],
-                    json=native,
-                    headers=upstream_headers(key),
-                    stream=True,
-                    timeout=(self.cfg["connect_timeout"], self.cfg["read_timeout"]),
-                    proxies=self.cfg["proxies"],
-                )
-            except requests.RequestException as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                debug(self.cfg, f"[chat] transport error: {last_error}")
-                continue
-
-            if resp.status_code == 200:
-                if streaming:
-                    self._stream(resp, model)
-                else:
-                    self._buffered(resp, model)
-                return
-
-            last_error = upstream_error(resp)
-            resp.close()
-            debug(self.cfg, f"[chat] upstream HTTP {resp.status_code}: {last_error}")
-            if resp.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS - 1:
-                continue
-            self._send_error(resp.status_code, last_error, "upstream_error")
-            return
-
-        self._send_error(502, f"Upstream request failed after {MAX_ATTEMPTS} attempts: "
-                              f"{last_error}", "upstream_error")
-
-    def _stream(self, resp, model):
-        translator = Translator(model, streaming=True)
-        self._sse_open()
         try:
-            for event in iter_events(resp):
-                for chunk in translator.feed(event):
-                    self._sse_frame(chunk)
+            while attempt < MAX_ATTEMPTS:
+                attempt += 1
+                key = pick_upstream_key(cfg, client_key)
+                debug(cfg, f"[chat] attempt {attempt}/{MAX_ATTEMPTS} key={mask(key) or '(none)'}")
+                try:
+                    resp = self._post(native, key)
+                except requests.RequestException as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    debug(cfg, f"[chat] transport error: {last_error}")
+                    if not opened and attempt >= MAX_ATTEMPTS:
+                        self._send_error(504 if "Timeout" in last_error else 502,
+                                         f"上游请求失败（{MAX_ATTEMPTS} 次尝试）：{last_error}",
+                                         "upstream_error")
+                        return
+                    time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
+                    continue
+
+                if resp.status_code != 200:
+                    status = resp.status_code
+                    detail = sanitize_error_text(cfg, upstream_error(resp))
+                    resp.close()
+                    last_error = detail
+                    debug(cfg, f"[chat] upstream HTTP {status}: {detail}")
+                    if self._handle_upstream_failure(cfg, status, detail, attempt,
+                                                     attempt < MAX_ATTEMPTS):
+                        time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
+                        continue
+                    if not opened:
+                        self._send_error(status, detail, "upstream_error")
+                        return
+                    # Headers already sent — an SSE frame is the only channel left.
+                    translator.error = detail
+                    break
+
+                if not opened:
+                    self._sse_open()
+                    opened = True
+
+                try:
+                    # A broken upstream raises a RequestException here; a broken
+                    # *client* raises OSError from _sse_frame and must not be
+                    # mistaken for one, so only request errors are caught. The
+                    # client case unwinds to the handler below.
+                    for event in iter_events(resp):
+                        chunks = translator.feed(event)
+                        finished = translator.finished
+                        for chunk in chunks:
+                            self._sse_frame(chunk)
+                        if finished:
+                            break
+                except requests.RequestException as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    debug(cfg, "[chat] 流中断，尝试用同一 threadId 续写")
+                finally:
+                    resp.close()
+
                 if translator.finished:
                     break
+                if attempt >= MAX_ATTEMPTS:
+                    break
+                time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
+
+            if not opened:
+                self._send_error(502, f"上游请求失败：{last_error}", "upstream_error")
+                return
+
             final = translator.finalize()
             if final:
                 self._sse_frame(final)
             if translator.error:
-                self._sse_frame({"error": {"message": translator.error,
+                self._sse_frame({"error": {"message": sanitize_error_text(cfg, translator.error),
                                            "type": "upstream_error"}})
             self._sse_raw("data: [DONE]\n\n")
         except OSError:
-            # Client hung up mid-stream; nothing left to say to it.
-            debug(self.cfg, "[chat] client disconnected during stream")
+            # The client hung up. Every upstream response is already closed by
+            # the loop's finally, so there is nothing left to release.
+            debug(cfg, "[chat] 客户端已断开")
         finally:
-            resp.close()
-            self._sse_end()
+            if opened:
+                self._sse_end()
 
-    def _buffered(self, resp, model):
+    # -- buffered ----------------------------------------------------------
+
+    def _buffered(self, native, model, client_key):
+        cfg = self.cfg
         translator = Translator(model, streaming=False)
-        try:
-            for event in iter_events(resp):
-                translator.feed(event)
-                if translator.finished:
-                    break
-        finally:
-            resp.close()
+        attempt = 0
+        last_error = None
+        status = None
+
+        while attempt < MAX_ATTEMPTS:
+            attempt += 1
+            key = pick_upstream_key(cfg, client_key)
+            try:
+                resp = self._post(native, key)
+            except requests.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                debug(cfg, f"[chat] transport error: {last_error}")
+                if attempt >= MAX_ATTEMPTS:
+                    self._send_error(504 if "Timeout" in last_error else 502,
+                                     f"上游请求失败（{MAX_ATTEMPTS} 次尝试）：{last_error}",
+                                     "upstream_error")
+                    return
+                time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
+                continue
+
+            status = resp.status_code
+            if status != 200:
+                last_error = sanitize_error_text(cfg, upstream_error(resp))
+                resp.close()
+                debug(cfg, f"[chat] upstream HTTP {status}: {last_error}")
+                if self._handle_upstream_failure(cfg, status, last_error, attempt,
+                                                 attempt < MAX_ATTEMPTS):
+                    time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
+                    continue
+                self._send_error(status, last_error, "upstream_error")
+                return
+
+            try:
+                for event in iter_events(resp):
+                    translator.feed(event)
+                    if translator.finished:
+                        break
+            except requests.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                debug(cfg, "[chat] 流中断，尝试用同一 threadId 续写")
+            finally:
+                resp.close()
+
+            if translator.finished:
+                break
+            if attempt >= MAX_ATTEMPTS:
+                break
+            time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
+
         if translator.error:
-            self._send_error(502, translator.error, "upstream_error")
+            self._send_error(502, sanitize_error_text(cfg, translator.error), "upstream_error")
             return
         self._send_json(200, translator.completion())
+
+
+class BridgeServer(ThreadingHTTPServer):
+    """A keep-alive handler blocks reading the next request line after each
+    response, so a client that goes away mid-connection surfaces as a
+    ConnectionResetError from socketserver — which would print a full traceback
+    for every aborted connection. Those are expected; everything else still
+    reports normally."""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, TimeoutError)):
+            if BridgeHandler.cfg:
+                debug(BridgeHandler.cfg, f"[http] {client_address[0]} 连接已断开")
+            return
+        super().handle_error(request, client_address)
 
 
 # ---------------------------------------------------------------------------
@@ -1020,16 +1560,20 @@ def main():
     cfg = load_config()
     BridgeHandler.cfg = cfg
 
-    if cfg["api_keys"]:
-        print(f"[bridge] upstream keys: {len(cfg['api_keys'])} from {cfg['key_source']}"
+    keys = ensure_api_keys(cfg)
+
+    if keys:
+        print(f"[bridge] upstream keys: {len(keys)} from {cfg['key_source']}"
               + (" (pinned)" if cfg["key_pinned"] else " (round-robin)"))
-        for key in cfg["api_keys"]:
+        for key in keys:
             print(f"[bridge]   {mask(key)}")
     else:
         print("[bridge] upstream keys: none — only client-supplied 'user_*' keys will work")
     print(f"[bridge] generate endpoint: {cfg['base_url']}")
     print(f"[bridge] models endpoint:   {cfg['models_url']}")
     print(f"[bridge] default model:     {cfg['default_model']}")
+    print(f"[bridge] cli disguise:      workingDir={cfg['working_dir']} "
+          f"slug={cfg['project_slug']}")
     if cfg["proxy"]:
         print(f"[bridge] outbound proxy:    {cfg['proxy']}")
     else:
@@ -1037,8 +1581,7 @@ def main():
     if cfg["api_key"]:
         print("[bridge] client auth:       required (Authorization: Bearer <api_key>)")
 
-    server = ThreadingHTTPServer((cfg["host"], cfg["port"]), BridgeHandler)
-    server.daemon_threads = True
+    server = BridgeServer((cfg["host"], cfg["port"]), BridgeHandler)
     print(f"[bridge] listening on http://{cfg['host']}:{cfg['port']}/v1  "
           f"(Ctrl+C to stop)\n")
     try:

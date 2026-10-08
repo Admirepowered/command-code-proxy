@@ -1,9 +1,9 @@
 # command-code OpenAI bridge
 
-A local proxy that exposes an **OpenAI-compatible Chat Completions API** and forwards
-requests to the command-code native `/alpha/generate` endpoint, translating requests and
-responses both ways. `GET /v1/models` is served live from the official
-**Command Code Provider API**.
+A Python port of [c0mmandc0de2api](https://github.com/) (TypeScript): a local proxy that
+exposes an **OpenAI-compatible Chat Completions API** and forwards requests to the
+command-code native `/alpha/generate` endpoint, translating requests and responses both
+ways. `GET /v1/models` is served live from the official **Command Code Provider API**.
 
 ```
 your app ── OpenAI /v1/chat/completions ──┐
@@ -12,6 +12,8 @@ your app ── OpenAI /v1/chat/completions ──┐
 ```
 
 Everything lives in a single `main.py` — no model catalog to keep in sync, no split modules.
+Beyond the port it adds **outbound HTTP proxy support** (the CLI has none, and on some
+networks a direct connection to `api.commandcode.ai` fails at the TLS handshake).
 
 ## Requirements
 
@@ -31,13 +33,16 @@ upper-cased environment variable — `PORT=9000 python main.py`.
 | `proxy` | — | outbound HTTP(S) proxy, e.g. `http://127.0.0.1:7890` |
 | `connect_timeout` | `15` | connect timeout, seconds |
 | `read_timeout` | `600` | streaming read timeout, seconds |
+| `auth_timeout` | `15000` | ms to wait for the OAuth browser callback (CLI default) |
 | `host` / `port` | `0.0.0.0` / `8080` | listen address |
 | `api_key` | — | optional: require this bearer token from clients |
 | `debug` | — | `true` logs upstream calls and the key in use (masked) |
 | `default_model` | `deepseek/deepseek-v4-flash` | used when the client omits `model` |
 | `models` | — | optional comma-separated filter/order for `/v1/models` |
 | `models_ttl` | `300` | seconds the upstream model list is cached |
-| `working_dir`, `environment`, `memory`, `taste`, `skills`, `permission_mode` | — | fields of the native request envelope |
+| `working_dir` | *random* | empty uses a random fake CLI path — see **CLI disguise** |
+| `environment` | *random* | empty uses a fake Node CLI fingerprint |
+| `memory`, `taste`, `skills`, `permission_mode` | — | fields of the native request envelope |
 
 ### API key lookup
 
@@ -51,7 +56,8 @@ The upstream key is resolved once at startup, stopping at the first source that 
 | 4 | `~/.commandcode/auth.json` | |
 | 5 | `~/.pi/agent/auth.json` | pi-compatible |
 | 6 | `~/.omp/agent/auth.json` | OMP-compatible |
-| 7 | client-supplied key | only when nothing above matched — see below |
+| 7 | **OAuth browser login** | only when nothing above matched — see below |
+| 8 | client-supplied key | only when nothing above matched — see below |
 
 `auth.json` accepts `{"apiKey": "user_..."}`, `{"commandcode": "user_..."}`, or
 `{"command-code": {"type": "api", "key": "user_..."}}`.
@@ -63,9 +69,51 @@ Claude Code and the OpenAI SDKs refuse to start without *some* token set, so a p
 like `sk-none` would otherwise be forwarded and turn a perfectly good server key into a 401.
 When `.env auth_token` is set it wins over everything.
 
-Under `COMMANDCODE_API_KEYS` the proxy rotates keys: on a transport error or a retryable
-status (408/409/425/429/5xx) it retries up to 3 times with backoff, picking the next key in
-the pool each attempt. Once a response has begun streaming, nothing is retried.
+### OAuth browser login
+
+When no key is found anywhere, the proxy runs the same login the CLI does: it starts a
+throwaway HTTP server on `127.0.0.1:5959` (the next 9 ports if taken, then any free one),
+opens `commandcode.ai/studio/auth/cli` in the browser, and waits `auth_timeout` ms for the
+Studio site to POST the key back to `/callback`. A `state` token is checked against CSRF.
+The key is saved to `~/.commandcode/auth.json`. If the callback times out or the local
+server cannot bind, it falls back to a terminal paste (a pasted `auth.json` blob is
+unwrapped to its key, and bracketed-paste escape codes are stripped).
+
+The CLI's 15-second default is short for a browser round-trip — raise `auth_timeout` if you
+find yourself landing in the paste fallback.
+
+### CLI disguise
+
+The upstream fingerprints its clients, so a fixed deployment path and a bare `"terminal"`
+environment string are not what a real CLI session looks like. Following the CLI, each
+process:
+
+- generates a **random working directory** once at startup (`/Users/kqbmx/dev/wplt`-style).
+  Stable for the process lifetime — a real user keeps working in one directory — and
+  different after a restart, so no cross-restart fingerprint forms;
+- derives `x-project-slug` from it the way the CLI does
+  (`/Users/alice/Code` → `users-alice-code`);
+- reports `environment` as `linux-x64, Node.js v20.11.0`;
+- sends `x-taste-learning` and `x-co-flag` alongside the version headers.
+
+**Setting `working_dir` or `environment` in `.env` overrides the disguise.** Leave them
+empty to keep it.
+
+### Retries, key rotation and the hard-limit cooldown
+
+A chat request is attempted up to 3 times with backoff, taking the next key from the pool
+each attempt. Transport errors and 408/409/425/429/5xx are retried; 4xx like
+`MODEL_NOT_IN_PLAN` rotate the key too, since another key may be on a different plan.
+
+If a stream breaks mid-response, the retry re-POSTs with the **same `threadId`**, so the
+upstream resumes the generation and the client keeps receiving deltas into the same
+assistant message.
+
+Once *every* key in the pool has come back hard-limited (a 429 carrying
+`Your limit resets at`), the proxy enters a **5-minute cooldown** and answers 429 locally
+with a `Retry-After` header instead of hammering the upstream.
+
+Upstream error text is passed back only after any key appearing in it is masked.
 
 ### Model list
 
@@ -121,12 +169,21 @@ curl -N http://localhost:3000/v1/chat/completions \
 
 Verified against the live API — these constraints drive the whole translation layer:
 
-- **`messages[].content` must be a plain string.** Structured content blocks are rejected:
-  `expected "text" at "params.messages[2].content[0].type"`. So tool results are flattened
-  into `"[tool result for <id>]"` user turns and prior assistant tool calls become
-  `"[called tool name(args)]"` markers.
-- **The system prompt goes in `params.system`**, not as a message. The upstream then folds
-  it back into `messages[0]` itself.
+- **Messages are role-discriminated, not the OpenAI shape.** Each role accepts a different
+  content type, and the upstream normalizes all of it into standard OpenAI `tool_calls` /
+  `tool_call_id` internally:
+
+  | role | accepted content |
+  |---|---|
+  | `system` | goes in `params.system` instead |
+  | `user` | a plain string (a `tool-result` block here is rejected outright) |
+  | `assistant` | `[text \| reasoning \| tool-call]` blocks |
+  | `tool` | `[tool-result]` blocks; must follow an assistant `tool_calls` turn |
+
+  Tool structure therefore survives the round trip intact — an agentic client gets a real
+  tool conversation, not flattened text. (Sending the OpenAI shape directly is rejected:
+  `expected one of "user"|"assistant" at "params.messages[2].role"`.)
+
 - **`stream: true` is mandatory.** The endpoint refuses non-streaming calls, so
   non-streaming clients get the stream consumed and buffered into one response object.
 - **The response is newline-delimited JSON**, not `data:`-framed SSE. Event vocabulary
