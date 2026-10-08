@@ -18,7 +18,8 @@ networks a direct connection to `api.commandcode.ai` fails at the TLS handshake)
 ## Requirements
 
 - Python 3.10+ (tested on 3.14)
-- `requests`
+- `requests` — **optional.** If it is missing, the proxy falls back to a stdlib
+  `urllib` transport automatically; `pip install requests` only buys connection pooling.
 
 ## Configuration
 
@@ -142,6 +143,18 @@ Point your client at `http://localhost:3000/v1` (any API key, unless `api_key` i
 | `/v1/chat/completions` | POST | streaming and non-streaming |
 | `/v1/models` | GET | live from the Provider API |
 | `/health` | GET | shows the resolved endpoints, key count and proxy |
+
+## Transports
+
+`requests` is used when importable; otherwise a stdlib `urllib` shim (same `Session` /
+`Response` surface, its own `RequestException`) takes over, so the proxy runs on a bare
+interpreter with nothing installed. The startup banner reports which one is active.
+
+Both transports send an explicit `User-Agent`. That is load-bearing: Cloudflare answers the
+default `Python-urllib/3.x` agent with a **403 `Error 1010: Access denied`** (browser-signature
+block), which looks exactly like an auth failure but is really the CDN refusing the client.
+`requests`' default agent happens to pass, which is why the gap only shows up on the stdlib
+path.
 
 ## Quick check
 

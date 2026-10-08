@@ -20,7 +20,8 @@ everything below; all of them were verified against the live endpoint:
     always with `stream: true` — a non-streaming request is refused upstream, so
     non-streaming callers get a buffered single-object response instead.
 
-Single file, stdlib + `requests`.   Run:  python main.py
+Single file. `requests` is used when available and the stdlib urllib shim below
+takes over when it is not.   Run:  python main.py
 """
 
 import hmac
@@ -28,16 +29,22 @@ import json
 import os
 import random
 import re
+import socket
 import string
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import requests
+try:  # preferred: connection pooling and cleaner streaming
+    import requests
+except ImportError:  # noqa: S110 — the stdlib shim below covers everything we use
+    requests = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -77,11 +84,17 @@ DEFAULTS = {
 }
 
 # The CLI's own headers. The version header selects the event vocabulary —
-# 0.38.2 is the shape handled by Translator.
+# 0.38.2 is the shape handled by Translator. The User-Agent is required, not
+# cosmetic: Cloudflare answers the default `Python-urllib/3.x` with a 403
+# "Error 1010: Access denied" (browser-signature block), so the stdlib transport
+# must present something explicit. Any non-default UA passes.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36")
 CLI_VERSION = "0.38.2"
 UPSTREAM_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "text/event-stream",
+    "User-Agent": USER_AGENT,
     "x-command-code-version": CLI_VERSION,
     "x-cli-environment": "production",
     "x-taste-learning": "true",
@@ -94,7 +107,177 @@ RETRY_DELAY = 0.2  # seconds; doubles per attempt, as in the CLI
 RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 HARD_LIMIT_COOLDOWN = 300.0  # seconds to stop calling upstream once every key is limited
 
-SESSION = requests.Session()
+
+# ---------------------------------------------------------------------------
+# Transport
+#
+# `requests` is preferred — its pooled connections and lazy byte iteration suit
+# long SSE streams — but the proxy has to run on a bare interpreter too, so an
+# ImportError falls back to a stdlib urllib shim exposing the small surface used
+# here: a Session with get/post, a Response with status_code / iter_lines /
+# json / text / close, and a RequestException to catch. Errors raised by both
+# paths derive from RequestException, so callers never care which is active.
+# ---------------------------------------------------------------------------
+
+
+def iter_raw_lines(raw):
+    """Yield one decoded line at a time, dropping the line terminator. A decode
+    failure is skipped rather than aborting the stream, matching the lenient
+    handling the requests path applies to a stray byte.
+
+    http.client fully decodes chunked transfers before readline sees them, so
+    this reader needs no transfer-encoding awareness."""
+    reader = raw.readline
+    while True:
+        line = reader()
+        if not line:
+            return
+        try:
+            yield line.decode("utf-8").rstrip("\r\n")
+        except UnicodeDecodeError:
+            continue
+
+
+if requests is not None:
+    RequestException = requests.RequestException
+
+    class Session:
+        """requests.Session subclass exposing iter_lines as bytes, so the event
+        reader is byte-oriented on both transports."""
+
+        def __init__(self):
+            self._session = requests.Session()
+
+        def _with_bytes(self, resp):
+            if not hasattr(resp, "_byte_iter_lines"):
+                def iter_lines(**kwargs):
+                    kwargs["decode_unicode"] = False
+                    return requests.Response.iter_lines(resp, **kwargs)
+                resp._byte_iter_lines = iter_lines
+            return resp
+
+        def get(self, url, **kwargs):
+            return self._with_bytes(self._session.get(url, **kwargs))
+
+        def post(self, url, **kwargs):
+            return self._with_bytes(self._session.post(url, **kwargs))
+
+else:
+    # `post(json=...)` binds its parameter over the module, so keep our own
+    # handle on the json module.
+    _json = json
+
+    class RequestException(Exception):
+        pass
+
+    class _Headers:
+        """requests.headers.entries() used to forward upstream headers."""
+
+        def __init__(self, message):
+            self._message = message
+
+        def get(self, name, default=None):
+            return self._message.get(name, default)
+
+        def entries(self):
+            return list(self._message.items())
+
+    class Response:
+        def __init__(self, status_code, headers, raw, body, exception_cls):
+            self.status_code = status_code
+            self.headers = headers
+            self._raw = raw
+            self._body = body
+            self._exc = exception_cls
+
+        def iter_lines(self, decode_unicode=False):
+            if self._raw is None:
+                return
+            lines = iter_raw_lines(self._raw)
+            if decode_unicode:
+                return lines
+            return (line.encode("utf-8") for line in lines)
+
+        def json(self):
+            if self._body is None:
+                self._body = self._raw.read()
+                try:
+                    self._raw.close()
+                except Exception:
+                    pass
+            return json.loads(self._body.decode("utf-8"))
+
+        @property
+        def text(self):
+            if self._body is None:
+                self._body = self._raw.read()
+                try:
+                    self._raw.close()
+                except Exception:
+                    pass
+            return self._body.decode("utf-8", "replace")
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise self._exc(f"HTTP {self.status_code}")
+
+        def close(self):
+            try:
+                if self._raw is not None:
+                    self._raw.close()
+            except Exception:
+                pass
+
+    class Session:
+        def get(self, url, headers=None, timeout=None, proxies=None):
+            return self._request("GET", url, headers=headers, timeout=timeout,
+                                 proxies=proxies)
+
+        def post(self, url, json=None, headers=None, stream=False,
+                 timeout=None, proxies=None):
+            body = None
+            headers = dict(headers or {})
+            if json is not None:
+                body = _json.dumps(json).encode("utf-8")
+                headers.setdefault("Content-Type", "application/json")
+            return self._request("POST", url,
+                                 headers=headers, body=body, timeout=timeout,
+                                 proxies=proxies, stream=stream)
+
+        def _request(self, method, url, headers=None, body=None,
+                     timeout=None, proxies=None, stream=True):
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(proxies or {})
+            ) if proxies else urllib.request.build_opener()
+            request = urllib.request.Request(url, data=body, method=method,
+                                             headers=headers or {})
+            try:
+                raw = opener.open(request, timeout=_read_timeout(timeout))
+            except urllib.error.HTTPError as exc:
+                # An HTTPError is still a readable response — the upstream's
+                # error body is what callers want. http.client has already
+                # decoded any chunked transfer, so the body is read directly.
+                headers = _Headers(exc.headers)
+                if stream:
+                    return Response(exc.code, headers, exc, None, RequestException)
+                return Response(exc.code, headers, None, exc.read(), RequestException)
+            except (urllib.error.URLError, socket.timeout, OSError) as exc:
+                raise RequestException(str(exc)) from exc
+            headers = _Headers(raw.headers)
+            if stream:
+                return Response(raw.status, headers, raw, None, RequestException)
+            return Response(raw.status, headers, None, raw.read(), RequestException)
+
+
+def _read_timeout(timeout):
+    """urllib wants a single timeout; use the (connect, read) tuple's read half
+    when it was given, since what stalls a stream is the read."""
+    if isinstance(timeout, (tuple, list)) and len(timeout) == 2:
+        return timeout[1]
+    return timeout
+
+
+SESSION = Session()
 
 # ---------------------------------------------------------------------------
 # CLI disguise
@@ -625,7 +808,7 @@ _MODELS_LOCK = threading.Lock()
 
 
 def fetch_models(cfg):
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     key = pick_upstream_key(cfg)
     if key:
         headers["Authorization"] = f"Bearer {key}"
@@ -1397,7 +1580,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 debug(cfg, f"[chat] attempt {attempt}/{MAX_ATTEMPTS} key={mask(key) or '(none)'}")
                 try:
                     resp = self._post(native, key)
-                except requests.RequestException as exc:
+                except RequestException as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
                     debug(cfg, f"[chat] transport error: {last_error}")
                     if not opened and attempt >= MAX_ATTEMPTS:
@@ -1441,7 +1624,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                             self._sse_frame(chunk)
                         if finished:
                             break
-                except requests.RequestException as exc:
+                except RequestException as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
                     debug(cfg, "[chat] 流中断，尝试用同一 threadId 续写")
                 finally:
@@ -1486,7 +1669,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             key = pick_upstream_key(cfg, client_key)
             try:
                 resp = self._post(native, key)
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 debug(cfg, f"[chat] transport error: {last_error}")
                 if attempt >= MAX_ATTEMPTS:
@@ -1514,7 +1697,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     translator.feed(event)
                     if translator.finished:
                         break
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 debug(cfg, "[chat] 流中断，尝试用同一 threadId 续写")
             finally:
@@ -1570,6 +1753,8 @@ def main():
     else:
         print("[bridge] upstream keys: none — only client-supplied 'user_*' keys will work")
     print(f"[bridge] generate endpoint: {cfg['base_url']}")
+    print(f"[bridge] http transport:    "
+          + ("requests" if requests is not None else "urllib (stdlib fallback)"))
     print(f"[bridge] models endpoint:   {cfg['models_url']}")
     print(f"[bridge] default model:     {cfg['default_model']}")
     print(f"[bridge] cli disguise:      workingDir={cfg['working_dir']} "
