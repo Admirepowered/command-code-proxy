@@ -1,84 +1,83 @@
 # command-code OpenAI bridge
 
-A small local proxy that exposes **OpenAI-compatible** (Chat Completions, Responses) and
-**Anthropic-compatible** (Messages) APIs and forwards requests to the command-code
-`/alpha/generate` endpoint, translating requests and responses both ways.
-
-Other apps (NextChat, Cherry Studio, Codex, Claude Code, scripts using the OpenAI or Anthropic
-SDKs, etc.) point their `base_url` at this proxy and talk standard OpenAI/Anthropic; this server
-does the translation.
+A local proxy that exposes an **OpenAI-compatible Chat Completions API** and forwards
+requests to the command-code native `/alpha/generate` endpoint, translating requests and
+responses both ways. `GET /v1/models` is served live from the official
+**Command Code Provider API**.
 
 ```
-your app ── OpenAI /v1/chat/completions  ─┐
-            OpenAI /v1/responses         ─┤
-                                          ├─> bridge (python main.py) ── native /alpha/generate ──> api.commandcode.ai
-            Anthropic /v1/messages       ─┘
+your app ── OpenAI /v1/chat/completions ──┐
+                                          ├─▶ main.py ── /alpha/generate ──────▶ api.commandcode.ai
+             OpenAI /v1/models     ───────┘           └─ /provider/v1/models ──▶ api.commandcode.ai
 ```
+
+Everything lives in a single `main.py` — no model catalog to keep in sync, no split modules.
 
 ## Requirements
 
 - Python 3.10+ (tested on 3.14)
-- `requests` (`pip install requests` — usually already present)
+- `requests`
 
 ## Configuration
 
-Edit `.env` (same directory as `main.py`):
+Edit `.env` (same directory as `main.py`). Any key can also be supplied as the
+upper-cased environment variable — `PORT=9000 python main.py`.
 
-| key               | description                                              |
-|-------------------|----------------------------------------------------------|
-| `base_url`        | command-code endpoint (defaults to `/alpha/generate`)    |
-| `auth_token`      | command-code key; **highest-priority** upstream key — if set it is pinned and used for every request, overriding any client-supplied key. Leave empty to auto-discover (see below). |
-| `host`            | listen address (default `0.0.0.0`)                       |
-| `port`            | listen port (default `8080`)                             |
-| `default_model`   | model used when the client omits `model`                 |
-| `models`          | comma-separated catalog returned by `GET /v1/models`     || `working_dir`     | native request `workingDir` (default `/tmp`)             |
-| `environment`     | native request `environment` (default `terminal`)        |
-| `memory` / `taste`| native request memory / taste strings (default empty)    |
-| `skills`          | native request skills (default empty → null)             |
-| `permission_mode` | native request `permissionMode` (default `standard`)     |
+| key | default | description |
+|---|---|---|
+| `base_url` | `https://api.commandcode.ai/alpha/generate` | generation endpoint |
+| `models_url` | derived | model list source; empty derives `<origin>/provider/v1/models` |
+| `auth_token` | — | upstream key, **pinned** (see below) |
+| `proxy` | — | outbound HTTP(S) proxy, e.g. `http://127.0.0.1:7890` |
+| `connect_timeout` | `15` | connect timeout, seconds |
+| `read_timeout` | `600` | streaming read timeout, seconds |
+| `host` / `port` | `0.0.0.0` / `8080` | listen address |
+| `api_key` | — | optional: require this bearer token from clients |
+| `debug` | — | `true` logs upstream calls and the key in use (masked) |
+| `default_model` | `deepseek/deepseek-v4-flash` | used when the client omits `model` |
+| `models` | — | optional comma-separated filter/order for `/v1/models` |
+| `models_ttl` | `300` | seconds the upstream model list is cached |
+| `working_dir`, `environment`, `memory`, `taste`, `skills`, `permission_mode` | — | fields of the native request envelope |
 
 ### API key lookup
 
-The upstream command-code key is resolved per request in this priority order,
-stopping at the first source that yields a key:
+The upstream key is resolved once at startup, stopping at the first source that yields one:
 
 | # | source | notes |
-|---|--------|-------|
-| 1 | `.env` `auth_token` | **Pinned** — when set, it is used for every request and client-supplied keys are ignored. |
-| 2 | `COMMANDCODE_API_KEY` | Env var (also read from `.env`). |
-| 3 | `COMMANDCODE_API_KEYS` | Env var — comma/newline-separated **pool**, used round-robin. |
+|---|---|---|
+| 1 | `.env` `auth_token` | **Pinned** — used for every request; client keys ignored |
+| 2 | `COMMANDCODE_API_KEY` | env var, or written into `.env` |
+| 3 | `COMMANDCODE_API_KEYS` | comma/newline-separated **pool**, used round-robin |
 | 4 | `~/.commandcode/auth.json` | |
-| 5 | `~/.pi/agent/auth.json` | pi-compatible. |
-| 6 | `~/.omp/agent/auth.json` | OMP-compatible. |
-| 7 | client-supplied key | Per-request passthrough — see below. Only used when nothing in 2–6 is set. |
+| 5 | `~/.pi/agent/auth.json` | pi-compatible |
+| 6 | `~/.omp/agent/auth.json` | OMP-compatible |
+| 7 | client-supplied key | only when nothing above matched — see below |
 
-Each `auth.json` accepts three shapes: `{"apiKey": "user_..."}`,
-`{"commandcode": "user_..."}`, or `{"command-code": {"type": "api", "key": "user_..."}}`.
+`auth.json` accepts `{"apiKey": "user_..."}`, `{"commandcode": "user_..."}`, or
+`{"command-code": {"type": "api", "key": "user_..."}}`.
 
-**Client-key passthrough** lets each caller supply its own upstream key: the
-proxy reads it from the incoming request — `x-api-key` (Anthropic / Claude Code)
-or `Authorization: Bearer` (OpenAI) — and forwards it upstream, falling back to
-the server pool above when the caller sends no key. When `.env auth_token` is
-pinned it wins over client keys; otherwise a client-supplied key takes
-precedence over the `COMMANDCODE_API_KEY(S)` / `auth.json` pool.
+**Client-key passthrough** lets each caller bring its own upstream key. It reads
+`x-api-key` (Anthropic-style clients) or `Authorization: Bearer` (OpenAI clients) and
+forwards the key upstream — but **only if it starts with `user_`**. That guard matters:
+Claude Code and the OpenAI SDKs refuse to start without *some* token set, so a placeholder
+like `sk-none` would otherwise be forwarded and turn a perfectly good server key into a 401.
+When `.env auth_token` is set it wins over everything.
 
-### Model catalog (`models.py`)
+Under `COMMANDCODE_API_KEYS` the proxy rotates keys: on a transport error or a retryable
+status (408/409/425/429/5xx) it retries up to 3 times with backoff, picking the next key in
+the pool each attempt. Once a response has begun streaming, nothing is retried.
 
-The full command-code model registry (59 models: Anthropic, OpenAI, DeepSeek,
-Kimi, GLM, MiniMax, Qwen, Gemini, Grok, …) lives in `models.py`. It serves two
-purposes:
+### Model list
 
-- **`GET /v1/models`** — the `.env` `models` list selects and orders the entries
-  shown to clients (matching works on canonical ids *or* aliases); leave it
-  empty to serve the whole visible registry. Two free promo models are hidden,
-  mirroring the CLI picker, but stay callable when requested explicitly.
-- **Id resolution** — every request's `model` field passes through
-  `models.resolve()`, which maps legacy and gateway-specific ids onto the
-  canonical id sent upstream (e.g. `claude-opus-4-6` → `claude-opus-4-7`,
-  `zai/glm-5.2` → `zai-org/GLM-5.2`, `openai/gpt-5.6-luna` → `gpt-5.6-luna`).
-  Unknown ids pass through unchanged, so brand-new upstream models work
-  without a catalog update.
+`GET /v1/models` is fetched live from the official Provider API
+(`https://api.commandcode.ai/provider/v1/models`) and cached for `models_ttl` seconds, so
+new upstream models appear without a code change. It passes through `name`,
+`context_length` and `supported_endpoints` alongside the usual OpenAI fields. A failed
+refresh serves the previous copy; only a cold cache with a failing upstream returns 502.
 
+Optionally, `.env models="a,b,c"` narrows the list to those ids and orders it that way.
+The upstream catalog is not plan-filtered, so this is the way to hide models your plan
+cannot call (on a Go plan, e.g., `gpt-5.4` returns 403 `MODEL_NOT_IN_PLAN`).
 
 ## Run
 
@@ -86,91 +85,76 @@ purposes:
 python main.py
 ```
 
-Endpoints:
+Point your client at `http://localhost:3000/v1` (any API key, unless `api_key` is set).
 
-- `POST /v1/chat/completions` — OpenAI-compatible chat (streaming and non-streaming)
-- `POST /v1/responses` — OpenAI Responses API (streaming and non-streaming; what Codex uses)
-- `POST /v1/messages` — Anthropic Messages API (streaming and non-streaming; what Claude Code uses)
-- `GET  /v1/models` — model list
+## Endpoints
 
-Point your client at `http://localhost:8080/v1` (e.g. base URL `http://localhost:8080/v1`,
-any API key).
+| endpoint | method | notes |
+|---|---|---|
+| `/v1/chat/completions` | POST | streaming and non-streaming |
+| `/v1/models` | GET | live from the Provider API |
+| `/health` | GET | shows the resolved endpoints, key count and proxy |
 
 ## Quick check
 
 ```bash
 # streaming
-curl -N http://localhost:8080/v1/chat/completions \
+curl -N http://localhost:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"stream":true}'
 
 # non-streaming
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}'
 
-# Responses API (Codex)
-curl -N http://localhost:8080/v1/responses \
+# tool call
+curl -N http://localhost:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek/deepseek-v4-flash","instructions":"You are a terse assistant.","input":"hello","stream":true}'
+  -d '{"model":"deepseek/deepseek-v4-flash","stream":true,
+       "messages":[{"role":"user","content":"Weather in Paris? Use the tool."}],
+       "tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather",
+                 "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}'
 ```
 
-## Responses API (`/v1/responses`)
+## What the native endpoint actually requires
 
-Requests are translated from the Responses format to the same native call:
-- `instructions` (or `input` items with `type:"message"` / `role:"system"`) → native `params.system`
-- `input` items (`input_text`/`input_image`/`output_text`/`function_call`/`function_call_output`) →
-  native `messages` (tool outputs are flattened into user messages)
-- `tools` (`{type:"function", name, description, parameters}`) → native Anthropic shape;
-  `web_search`/`web_search_preview` → built-in `web_search_20250305`, `web_fetch` → `web_fetch_20250910`
-- `tool_choice`, `max_output_tokens`, `temperature`, `top_p` → mapped equivalents
+Verified against the live API — these constraints drive the whole translation layer:
 
-Streaming responses are re-emitted as the standard Responses SSE event sequence
-(`response.created`, `response.output_item.added`, `response.output_text.delta`,
-`response.function_call_arguments.delta`, … `response.completed`). Reasoning tokens are
-exposed via `response.reasoning_summary_text.delta` events. Non-streaming clients get a
-single complete `Response` object.
+- **`messages[].content` must be a plain string.** Structured content blocks are rejected:
+  `expected "text" at "params.messages[2].content[0].type"`. So tool results are flattened
+  into `"[tool result for <id>]"` user turns and prior assistant tool calls become
+  `"[called tool name(args)]"` markers.
+- **The system prompt goes in `params.system`**, not as a message. The upstream then folds
+  it back into `messages[0]` itself.
+- **`stream: true` is mandatory.** The endpoint refuses non-streaming calls, so
+  non-streaming clients get the stream consumed and buffered into one response object.
+- **The response is newline-delimited JSON**, not `data:`-framed SSE. Event vocabulary
+  (selected by the `x-command-code-version` header, currently `0.38.2`):
 
-## Anthropic Messages API (`/v1/messages`)
+  | event | handling |
+  |---|---|
+  | `start`, `start-step`, `provider-metadata`, `text-start`, `text-end`, `tool-input-end` | ignored |
+  | `text-delta` | → `delta.content` |
+  | `reasoning-delta` | → `delta.reasoning_content` |
+  | `tool-input-start` / `tool-input-delta` | → `delta.tool_calls[]` streamed as it arrives |
+  | `tool-call` | complete form; fills gaps the deltas left |
+  | `finish-step` | per-step usage, ignored |
+  | `finish` | `finish_reason` + `usage`, ends the stream |
+  | `error` | surfaced as an OpenAI error |
 
-Requests are translated from the Anthropic format to the same native call:
-- `system` (string or text blocks) → native `params.system`
-- `messages` content blocks: `text` → plain text; `tool_result` → `"[tool result for <id>]"`
-  user text (same convention as the OpenAI path); `tool_use` in history → `"[called tool ...]"`
-  marker; `image`/`document` → inline placeholders
-- `tools` — Anthropic `{name, description, input_schema}` already matches the native shape and
-  passes through; built-in `web_search_20250305`/`web_fetch_20250910` pass through untouched
-- `tool_choice` (`auto`/`any`/`none`/`{type:"tool", name}`) → mapped equivalents
-- `max_tokens`, `temperature`, `top_p`, `stop_sequences` → mapped equivalents
-
-Streaming responses use the standard Anthropic SSE sequence: `message_start` →
-`content_block_start` / `content_block_delta` (`thinking_delta`, `text_delta`,
-`input_json_delta`) / `content_block_stop` → `message_delta` (stop_reason + usage) →
-`message_stop`. Reasoning is surfaced as a `thinking` block. Non-streaming clients get a single
-complete message object with parsed `tool_use.input`. Errors use the Anthropic error envelope.
-
-## Translation notes
-
-- **System prompt** — OpenAI `system`/`developer` messages are joined into the native
-  `params.system` field.
-- **Tools** — OpenAI `{type:"function", function:{...}}` schemas are converted to the native
-  `{name, description, input_schema}` shape. Tool-call events are streamed back as OpenAI
-  `delta.tool_calls`. Note: the upstream emits tool calls but cannot execute them or accept
-  tool results within a single call, so `role:"tool"` results in history are flattened into
-  user messages.
-- **Streaming** — upstream always receives `stream: true` (the CLI endpoint rejects
-  non-streaming requests). Non-streaming clients get a buffered single JSON response.
-- **Reasoning** — reasoning deltas are exposed as `delta.reasoning_content`
-  (DeepSeek convention).
-- **Errors** — upstream errors are re-enveloped in the OpenAI error shape.
+- `finishReason: "tool-calls"` maps to OpenAI's `tool_calls`; `max-tokens` maps to `length`.
+- `usage` carries `prompt_tokens_details.cached_tokens` and
+  `completion_tokens_details.reasoning_tokens` when the upstream reports them.
 
 ## ⚠️ Risk disclosure
 
 The `/alpha/generate` endpoint is intended for the command-code **CLI** only. commandcode.ai
-actively detects proxying and warns that *"continued proxying of your subscription violates the
-TOS and will result in account ban."* Using this bridge may get your account banned.
+actively detects proxying and warns that *"continued proxying of your subscription violates
+the TOS and will result in account ban."* Using this bridge may get your account banned.
 
 A legitimate alternative exists: the official **Command Code Provider API**
 (`https://api.commandcode.ai/provider/v1`, OpenAI- and Anthropic-compatible, same key), which
-requires a plan with API access (GOAT/Provider+; the Go plan returns 403 `upgrade_required`).
-If your plan supports it, point your apps there directly and skip this bridge entirely.
+requires a plan with API access (Provider/GOAT+; the Go plan returns 403
+`upgrade_required`). If your plan supports it, point your apps there directly — this proxy
+only reads `/provider/v1/models` from it, precisely because that endpoint works on every plan.

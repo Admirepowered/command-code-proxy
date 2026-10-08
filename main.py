@@ -1,158 +1,179 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible bridge to the command-code /alpha/generate endpoint.
+"""command-code bridge — an OpenAI-compatible /v1/chat/completions endpoint on
+top of the command-code native /alpha/generate API.
 
-Exposes an OpenAI Chat Completions API (POST /v1/chat/completions, GET /v1/models)
-and translates each request into the native command-code body format, forwards it,
-and translates the native SSE response back into OpenAI SSE.
+    client (OpenAI JSON)  ──▶  this proxy  ──▶  /alpha/generate   (native NDJSON)
+    GET /v1/models        ──▶  https://api.commandcode.ai/provider/v1/models
 
-Run:  python main.py
+The native endpoint is text-only and stream-only. Three quirks shape everything
+below:
+
+  * `messages[].content` must be a **plain string** — structured content blocks
+    are rejected with a schema error, so tool results and prior tool calls are
+    flattened into text.
+  * The system prompt travels in its own `params.system` field, not as a message.
+  * Responses arrive as newline-delimited JSON events (not `data:` SSE frames),
+    always with `stream: true` — a non-streaming request is refused upstream, so
+    non-streaming callers get a buffered single-object response instead.
+
+Single file, stdlib + `requests`.   Run:  python main.py
 """
 
+import hmac
 import json
 import os
 import re
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-import models as catalog
-
 # ---------------------------------------------------------------------------
-# Config (.env)
+# Configuration
 # ---------------------------------------------------------------------------
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(HERE, ".env")
 
+# Every key can be overridden by the upper-cased environment variable of the
+# same name (PORT=9000 python main.py); the .env file is the usual place.
 DEFAULTS = {
+    # upstream
     "base_url": "https://api.commandcode.ai/alpha/generate",
+    "models_url": "",  # empty -> <base_url origin>/provider/v1/models
     "auth_token": "",
+    "proxy": "",  # e.g. http://127.0.0.1:7890 — empty falls back to HTTP(S)_PROXY
+    "connect_timeout": "15",
+    "read_timeout": "600",
+    # server
     "host": "0.0.0.0",
     "port": "8080",
-    # model settings
+    "api_key": "",  # optional: require this bearer token from clients
+    "debug": "",
+    # models
     "default_model": "deepseek/deepseek-v4-flash",
-    # native request envelope (optional overrides)
+    "models": "",  # optional comma-separated filter/order for GET /v1/models
+    "models_ttl": "300",  # seconds the upstream model list is cached
+    # native request envelope (see build_native_body)
     "working_dir": "/tmp",
     "environment": "terminal",
     "memory": "",
     "taste": "",
     "skills": "",
     "permission_mode": "standard",
-    "proxy": "",
 }
 
-# Headers the command-code CLI sends; forwarded upstream unchanged.
+# The CLI's own headers. Verified against the live endpoint: the version header
+# selects the event vocabulary, 0.38.2 is the shape handled by Translator.
 UPSTREAM_HEADERS = {
     "Content-Type": "application/json",
-    "x-command-code-version": "0.24.1",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+    "Accept": "text/event-stream",
+    "x-command-code-version": "0.38.2",
+    "x-cli-environment": "production",
 }
 
-# How many times to re-POST before reporting an upstream failure. At POST time
-# nothing has been streamed to the client yet, and /alpha/generate is a fresh,
-# stateless generation per call, so a retry is a safe remedy for transient
-# timeouts / 5xx upstream hiccups.
-UPSTREAM_RETRIES = 3
+MAX_OUTPUT_TOKENS = 200_000
+MAX_ATTEMPTS = 3
+RETRY_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+SESSION = requests.Session()
 
 
 def load_env(path):
-    """Minimal KEY=VALUE .env parser (no external dependency)."""
+    """Minimal KEY=VALUE .env reader (keeps the project dependency-free)."""
     env = {}
-    if not os.path.exists(path):
-        return env
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            env[key.strip()] = value.strip().strip('"').strip("'")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
     return env
 
 
-# CLI auth files checked, in order, when no higher-priority source yields a key.
-# Each may hold the key under "apiKey", "commandcode", or
-# {"command-code": {"type": "api", "key": "..."}}.
+# ---------------------------------------------------------------------------
+# Upstream keys
+# ---------------------------------------------------------------------------
+
+# Checked in order when no higher-priority source yields a key. Each file may
+# hold it under "apiKey", "commandcode", or {"command-code": {"type","key"}}.
 AUTH_FILE_CANDIDATES = (
-    os.path.join("~", ".commandcode", "auth.json"),
-    os.path.join("~", ".pi", "agent", "auth.json"),
-    os.path.join("~", ".omp", "agent", "auth.json"),
+    "~/.commandcode/auth.json",
+    "~/.pi/agent/auth.json",
+    "~/.omp/agent/auth.json",
 )
 
 
-def _read_auth_file(path):
-    """Extract a command-code key from one auth.json, trying the three accepted
-    shapes; return None on any miss, read error, or malformed JSON."""
+def read_auth_file(path):
     try:
-        with open(os.path.expanduser(path), encoding="utf-8") as f:
-            data = json.load(f)
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            data = json.load(fh)
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
         return None
     for field in ("apiKey", "commandcode"):
-        val = data.get(field)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+        value = data.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     cc = data.get("command-code")
     if isinstance(cc, dict) and cc.get("type") == "api":
-        val = cc.get("key")
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+        value = cc.get("key")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 
-def _split_keys(raw):
-    """Split a comma/newline-separated key list; trim, drop empties, and
-    de-duplicate while preserving order."""
+def split_keys(raw):
+    """Comma/newline-separated list -> trimmed, de-duplicated, order preserved."""
     if not raw:
         return []
     seen, out = set(), []
-    for k in re.split(r"[,\n]", raw):
-        k = k.strip()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(k)
+    for key in re.split(r"[,\n]", raw):
+        key = key.strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
     return out
 
 
-def resolve_server_keys(env):
-    """Resolve the server-side upstream key(s) from the priority chain, stopping
-    at the first source that yields one:
+def resolve_server_keys(file_env):
+    """Resolve the server-side upstream key(s), stopping at the first source
+    that yields one:
 
-        .env auth_token  >  COMMANDCODE_API_KEY  >  COMMANDCODE_API_KEYS
-        >  ~/.commandcode/auth.json  >  ~/.pi/agent/auth.json  >  ~/.omp/...
+        .env auth_token > COMMANDCODE_API_KEY > COMMANDCODE_API_KEYS > auth.json
 
-    The env vars are also honoured if written into the .env file. Returns
-    (keys, pinned, source): `pinned` is True only when the operator set
-    `.env auth_token`, which then beats any per-request client-passthrough key;
-    `source` is a label for logging.
+    Returns (keys, pinned, source). `pinned` is set only by `.env auth_token`,
+    which then beats any client-supplied key.
     """
-    token = (env.get("auth_token") or "").strip()
+    token = (file_env.get("auth_token") or "").strip()
     if token:
         return [token], True, ".env auth_token"
     single = (os.environ.get("COMMANDCODE_API_KEY")
-              or env.get("COMMANDCODE_API_KEY") or "").strip()
+              or file_env.get("COMMANDCODE_API_KEY") or "").strip()
     if single:
         return [single], False, "COMMANDCODE_API_KEY"
-    pool = _split_keys(os.environ.get("COMMANDCODE_API_KEYS")
-                       or env.get("COMMANDCODE_API_KEYS"))
+    pool = split_keys(os.environ.get("COMMANDCODE_API_KEYS")
+                      or file_env.get("COMMANDCODE_API_KEYS"))
     if pool:
         return pool, False, "COMMANDCODE_API_KEYS"
     for path in AUTH_FILE_CANDIDATES:
-        key = _read_auth_file(path)
+        key = read_auth_file(path)
         if key:
             return [key], False, path
     return [], False, "none"
 
 
 class KeyPool:
-    """Thread-safe round-robin over one or more upstream keys. Returns '' when
-    empty so an unauthorized upstream reply is surfaced unchanged."""
+    """Thread-safe round-robin over the server-side keys."""
 
     def __init__(self, keys):
         self._keys = [k for k in keys if k]
@@ -171,108 +192,234 @@ class KeyPool:
         return len(self._keys)
 
 
-def get_config():
-    env = load_env(ENV_PATH)
+def mask(key):
+    return key if len(key) <= 12 else f"{key[:8]}…{key[-4:]}"
+
+
+def client_key_from_headers(headers):
+    """A caller may bring its own upstream key. Only a key that actually looks
+    like one is forwarded — clients such as Claude Code and the OpenAI SDK
+    insist on setting *some* bearer token, and forwarding a placeholder like
+    "sk-none" would turn a working server key into a 401."""
+    raw = (headers.get("x-api-key") or "").strip()
+    if not raw:
+        auth = headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            raw = auth[7:].strip()
+    return raw if raw.startswith("user_") else ""
+
+
+def pick_upstream_key(cfg, client_key=""):
+    if cfg["key_pinned"]:
+        return cfg["api_keys"][0]
+    if client_key:
+        return client_key
+    return cfg["key_pool"].next()
+
+
+def parse_proxy(raw):
+    """A single proxy URL applies to both schemes. Empty returns None so that
+    requests falls back to the standard HTTP_PROXY / HTTPS_PROXY variables."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    return {"http": raw, "https": raw}
+
+
+def derive_models_url(base_url):
+    parts = urllib.parse.urlsplit(base_url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}/provider/v1/models"
+    return "https://api.commandcode.ai/provider/v1/models"
+
+
+def load_config():
+    file_env = load_env(ENV_PATH)
     cfg = {}
     for key, default in DEFAULTS.items():
-        cfg[key] = env.get(key, default) or default
-    keys, pinned, source = resolve_server_keys(env)
-    cfg["api_keys"] = keys
-    cfg["key_pinned"] = pinned
-    cfg["key_source"] = source
+        value = os.environ.get(key.upper())
+        if value is None:
+            value = file_env.get(key)
+        cfg[key] = default if value in (None, "") else value
+    cfg["port"] = int(cfg["port"])
+    cfg["models_ttl"] = max(0, int(cfg["models_ttl"]))
+    cfg["connect_timeout"] = float(cfg["connect_timeout"])
+    cfg["read_timeout"] = float(cfg["read_timeout"])
+    cfg["proxies"] = parse_proxy(cfg["proxy"])
+    cfg["models_url"] = cfg["models_url"] or derive_models_url(cfg["base_url"])
+    cfg["debug"] = str(cfg["debug"]).lower() in ("1", "true", "yes", "on") or \
+        str(os.environ.get("DEBUG", "")).lower() in ("1", "true", "yes", "on")
+    keys, pinned, source = resolve_server_keys(file_env)
+    cfg["api_keys"], cfg["key_pinned"], cfg["key_source"] = keys, pinned, source
     cfg["key_pool"] = KeyPool(keys)
-    # Back-compatible single-token view: the first key the pool would use.
-    cfg["auth_token"] = keys[0] if keys else ""
-    if not keys:
-        print("[warn] no server API key resolved (.env / env vars / auth.json); "
-              "requests without a client-supplied key will be unauthorized",
-              file=sys.stderr)
-    # Build requests-compatible proxies dict from the single proxy URL.
-    proxy_url = cfg.get("proxy", "").strip()
-    if proxy_url:
-        cfg["proxies"] = {"http": proxy_url, "https": proxy_url}
-    else:
-        cfg["proxies"] = None
     return cfg
 
 
+def debug(cfg, *parts):
+    if cfg["debug"]:
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] " + " ".join(str(p) for p in parts) + "\n")
+        sys.stderr.flush()
+
+
+def upstream_headers(key):
+    headers = dict(UPSTREAM_HEADERS)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
 # ---------------------------------------------------------------------------
-# OpenAI -> native request conversion
+# GET /v1/models — live from the official Provider API
+# ---------------------------------------------------------------------------
+
+_MODELS_CACHE = {"at": 0.0, "payload": None}
+_MODELS_LOCK = threading.Lock()
+
+
+def fetch_models(cfg):
+    headers = {"Accept": "application/json"}
+    key = pick_upstream_key(cfg)
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    resp = SESSION.get(cfg["models_url"], headers=headers,
+                       timeout=(cfg["connect_timeout"], 30), proxies=cfg["proxies"])
+    resp.raise_for_status()
+    body = resp.json()
+    items = body.get("data") if isinstance(body, dict) else body
+    if not isinstance(items, list):
+        raise ValueError(f"unexpected model list payload: {str(body)[:200]}")
+
+    created = int(time.time())
+    models = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        entry = {
+            "id": item["id"],
+            "object": "model",
+            "created": item.get("created") or created,
+            "owned_by": item.get("owned_by") or "command-code",
+        }
+        for extra in ("name", "context_length", "supported_endpoints"):
+            if item.get(extra) is not None:
+                entry[extra] = item[extra]
+        models.append(entry)
+    return {"object": "list", "data": apply_model_filter(cfg, models)}
+
+
+def apply_model_filter(cfg, models):
+    """`.env models="a,b"` selects and orders the visible catalog. A filter that
+    matches nothing is ignored rather than emptying the list under the client."""
+    wanted = [w.strip() for w in (cfg["models"] or "").split(",") if w.strip()]
+    if not wanted:
+        return models
+    by_id = {m["id"].lower(): m for m in models}
+    chosen = [by_id[w.lower()] for w in wanted if w.lower() in by_id]
+    if not chosen:
+        debug(cfg, f"[models] filter matched none of {len(models)} models; showing all")
+        return models
+    return chosen
+
+
+def get_models(cfg):
+    """Cached model list. A failed refresh serves the previous copy if there is
+    one; only a cold cache with a failing upstream surfaces an error."""
+    ttl = cfg["models_ttl"]
+    cached = _MODELS_CACHE["payload"]
+    if cached is not None and time.time() - _MODELS_CACHE["at"] < ttl:
+        return cached
+    try:
+        payload = fetch_models(cfg)
+    except Exception as exc:
+        if cached is not None:
+            debug(cfg, f"[models] refresh failed ({exc}); serving cached list")
+            return cached
+        raise
+    with _MODELS_LOCK:
+        _MODELS_CACHE["at"] = time.time()
+        _MODELS_CACHE["payload"] = payload
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# OpenAI request -> native request
 # ---------------------------------------------------------------------------
 
 
 def parts_to_text(parts):
-    """Flatten an OpenAI content-parts array into plain text.
-
-    Handles both Chat Completions parts (text/image_url) and Responses-API
-    parts (input_text/output_text/refusal/input_image/input_file). The native
-    endpoint is text-only, so non-text parts are represented inline rather than
-    dropped silently. A missing/None content array is treated as empty.
-    """
+    """Flatten an OpenAI content-parts array into plain text. The native
+    endpoint is text-only, so images and files become inline placeholders
+    instead of being dropped silently."""
     out = []
     for part in parts or []:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type")
-        if ptype in ("text", "input_text", "output_text"):
-            out.append(part.get("text", ""))
-        elif ptype == "refusal":
-            out.append(part.get("refusal", ""))
-        elif ptype in ("image_url", "input_image", "input_file"):
-            out.append(f"[{ptype.removeprefix('input_')}]")
-        else:
-            if "text" in part:
+        if isinstance(part, str):
+            out.append(part)
+        elif isinstance(part, dict):
+            ptype = part.get("type")
+            if ptype in ("text", "input_text", "output_text"):
+                out.append(part.get("text", ""))
+            elif ptype == "refusal":
+                out.append(part.get("refusal", ""))
+            elif ptype in ("image_url", "input_image", "input_file"):
+                out.append(f"[{ptype.removeprefix('input_')}]")
+            elif "text" in part:
                 out.append(str(part.get("text", "")))
-    return "\n".join(out)
+    return "\n".join(t for t in out if t)
+
+
+def tool_args(raw):
+    return raw if isinstance(raw, str) else json.dumps(raw or {}, ensure_ascii=False)
 
 
 def convert_messages(messages):
-    """Split OpenAI messages into (native_messages, system_text).
+    """Split OpenAI messages into (native messages, system prompt).
 
-    The native API only accepts `user`/`assistant` roles and keeps the system
-    prompt in a separate `params.system` field, so:
-      - system/developer messages -> concatenated into the system prompt
-      - tool messages             -> flattened into a user message
-      - assistant tool_calls      -> stripped (kept as plain text if any)
+    The native API accepts only user/assistant roles with string content, so
+    system/developer messages are merged into `params.system`, tool messages
+    become "[tool result for <id>]" user turns, and assistant tool calls are
+    kept as an inline marker so the model sees its own prior actions.
     """
-    native = []
-    system_parts = []
+    native, system_parts = [], []
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
-        role = msg.get("role")
-        content = msg.get("content")
+        role, content = msg.get("role"), msg.get("content")
+
         if role in ("system", "developer"):
-            if isinstance(content, str):
-                system_parts.append(content)
-            else:
-                system_parts.append(parts_to_text(content))
+            system_parts.append(content if isinstance(content, str) else parts_to_text(content))
             continue
         if role == "tool":
             text = content if isinstance(content, str) else parts_to_text(content)
-            tool_call_id = msg.get("tool_call_id") or "?"
             native.append({
                 "role": "user",
-                "content": f"[tool result for {tool_call_id}]\n{text}",
+                "content": f"[tool result for {msg.get('tool_call_id') or '?'}]\n{text}",
             })
             continue
-        if role in ("user", "assistant"):
-            if isinstance(content, str):
-                native.append({"role": role, "content": content})
-            elif isinstance(content, list):
-                native.append({"role": role, "content": parts_to_text(content)})
-            elif content is None:
-                # e.g. an assistant message that only carried tool_calls
-                native.append({"role": role, "content": ""})
+        if role not in ("user", "assistant"):
+            continue
+
+        if isinstance(content, list):
+            text = parts_to_text(content)
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = ""
+        if role == "assistant" and msg.get("tool_calls"):
+            markers = [
+                f"[called tool {tc.get('function', {}).get('name', '?')}"
+                f"({tool_args(tc.get('function', {}).get('arguments'))})]"
+                for tc in msg["tool_calls"] if isinstance(tc, dict)
+            ]
+            text = "\n".join([text] + markers) if text else "\n".join(markers)
+        native.append({"role": role, "content": text})
+
     system = "\n\n".join(p for p in system_parts if p)
     return native, system
 
 
 def convert_tools(tools):
-    """Convert OpenAI tool schemas to the native {name, description, input_schema} shape.
-
-    Built-in web_search/web_fetch tools are passed through untouched.
-    """
+    """OpenAI tool defs -> the native {name, description, input_schema} shape.
+    Built-in web_search / web_fetch tools already match and pass through."""
     out = []
     for tool in tools or []:
         if not isinstance(tool, dict):
@@ -283,7 +430,7 @@ def convert_tools(tools):
             out.append({
                 "name": fn.get("name", ""),
                 "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+                "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
             })
         elif ttype in ("web_search_20250305", "web_fetch_20250910"):
             out.append(tool)
@@ -291,12 +438,11 @@ def convert_tools(tools):
 
 
 def convert_tool_choice(tool_choice):
-    """Map OpenAI tool_choice to the native AI-SDK toolChoice value."""
     if tool_choice is None:
         return None
     if isinstance(tool_choice, str):
-        return {"none": "none", "auto": "auto", "required": "required",
-                "tool_calls": "required"}.get(tool_choice, tool_choice)
+        return {"none": "none", "auto": "auto",
+                "required": "required", "tool_calls": "required"}.get(tool_choice, tool_choice)
     if isinstance(tool_choice, dict):
         fn = tool_choice.get("function") or {}
         name = fn.get("name") if isinstance(fn, dict) else None
@@ -305,18 +451,15 @@ def convert_tool_choice(tool_choice):
     return None
 
 
-MAX_OUTPUT_TOKENS = 200_000
-
-
 def build_native_body(params, cfg):
     """Wrap converted params in the top-level command-code envelope."""
     if params.get("max_tokens") is not None:
         params["max_tokens"] = min(int(params["max_tokens"]), MAX_OUTPUT_TOKENS)
-    body = {
+    return {
         "config": {
-            "workingDir": cfg.get("working_dir") or "/tmp",
+            "workingDir": cfg["working_dir"] or "/tmp",
             "date": time.strftime("%Y-%m-%d"),
-            "environment": cfg.get("environment") or "terminal",
+            "environment": cfg["environment"] or "terminal",
             "structure": [],
             "isGitRepo": False,
             "currentBranch": "",
@@ -324,336 +467,139 @@ def build_native_body(params, cfg):
             "gitStatus": "",
             "recentCommits": [],
         },
-        "memory": cfg.get("memory", ""),
-        "taste": cfg.get("taste", ""),
-        "skills": cfg.get("skills") or None,
-        "permissionMode": cfg.get("permission_mode") or "standard",
+        "memory": cfg["memory"],
+        "taste": cfg["taste"],
+        "skills": cfg["skills"] or None,
+        "permissionMode": cfg["permission_mode"] or "standard",
         "params": params,
     }
-    return body
 
 
-def convert_openai_request(openai_body, cfg):
-    """Translate an OpenAI /v1/chat/completions body into the native body.
-
-    `stream` is always forced to True upstream: the CLI endpoint rejects
-    non-streaming requests (anti-proxy check).
-    """
-    messages, system = convert_messages(openai_body.get("messages", []))
-    tools = convert_tools(openai_body.get("tools"))
-    tool_choice = convert_tool_choice(openai_body.get("tool_choice"))
-
+def convert_request(req, cfg):
+    """Translate an OpenAI Chat Completions body into the native body."""
+    messages, system = convert_messages(req.get("messages"))
     params = {
-        "model": catalog.resolve(openai_body.get("model"))
-                 or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
+        "model": req.get("model") or cfg["default_model"],
         "messages": messages,
-        "system": system,
-        "stream": True,
+        "temperature": req.get("temperature") if req.get("temperature") is not None else 0.3,
+        "stream": True,  # the native endpoint refuses anything else
     }
+    if system:
+        params["system"] = system
+    tools = convert_tools(req.get("tools"))
     if tools:
         params["tools"] = tools
+    tool_choice = convert_tool_choice(req.get("tool_choice"))
     if tool_choice is not None:
         params["toolChoice"] = tool_choice
-    # Whitelisted passthrough of common sampling params.
-    max_tokens = openai_body.get("max_tokens") or openai_body.get("max_completion_tokens")
-    if max_tokens is not None:
+    max_tokens = req.get("max_tokens") or req.get("max_completion_tokens")
+    if max_tokens:
         params["max_tokens"] = max_tokens
-    for key in ("temperature", "top_p", "stop"):
-        if openai_body.get(key) is not None:
-            params[key] = openai_body[key]
-    return build_native_body(params, cfg)
-
-
-def responses_input_to_messages(input_items, system_parts):
-    """Flatten OpenAI Responses-API `input` items into native user/assistant messages.
-
-    Items that have no text equivalent (previous function_call / reasoning items)
-    are represented inline, since the native API only accepts user/assistant text.
-    """
-    native = []
-    for item in input_items or []:
-        if isinstance(item, str):
-            native.append({"role": "user", "content": item})
-            continue
-        if not isinstance(item, dict):
-            continue
-        itype = item.get("type")
-        if itype == "function_call":
-            args = item.get("arguments", "")
-            name = item.get("name", "")
-            native.append({"role": "assistant", "content": f"[called {name}({args})]"})
-            continue
-        if itype == "function_call_output":
-            output = item.get("output", "")
-            if isinstance(output, (dict, list)):
-                output = json.dumps(output, ensure_ascii=False)
-            native.append({
-                "role": "user",
-                "content": f"[tool result for {item.get('call_id', '?')}]\n{output}",
-            })
-            continue
-        if itype in ("reasoning", "message_attempt"):
-            continue  # previous reasoning/attempts, not needed by the model
-        role = item.get("role")
-        content = item.get("content")
-        if role == "developer":
-            system_parts.append(content if isinstance(content, str) else parts_to_text(content))
-            continue
-        if role in ("user", "assistant"):
-            if isinstance(content, str):
-                native.append({"role": role, "content": content})
-            elif isinstance(content, list):
-                native.append({"role": role, "content": parts_to_text(content)})
-            elif content is None:
-                native.append({"role": role, "content": ""})
-    return native
-
-
-def convert_responses_tools(tools):
-    """Convert OpenAI Responses-API tool defs to the native shape.
-
-    Responses tools are {type: function, name, description, parameters};
-    built-ins (web_search / web_fetch) map to the native typed forms.
-    """
-    out = []
-    for tool in tools or []:
-        if not isinstance(tool, dict):
-            continue
-        ttype = tool.get("type")
-        if ttype == "function":
-            out.append({
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "input_schema": tool.get("parameters") or {"type": "object", "properties": {}},
-            })
-        elif ttype in ("web_search", "web_search_preview"):
-            out.append({"type": "web_search_20250305", "name": "web_search"})
-        elif ttype == "web_fetch":
-            out.append({"type": "web_fetch_20250910", "name": "web_fetch"})
-        elif ttype in ("web_search_20250305", "web_fetch_20250910"):
-            out.append(tool)
-    return out
-
-
-def convert_responses_tool_choice(tool_choice):
-    """Map Responses-API tool_choice ({type:function, name}) to the native value."""
-    if tool_choice is None:
-        return None
-    if isinstance(tool_choice, str):
-        return {"none": "none", "auto": "auto", "required": "required"}.get(tool_choice, tool_choice)
-    if isinstance(tool_choice, dict):
-        name = tool_choice.get("name")
-        if name:
-            return {"type": "tool", "toolName": name}
-    return None
-
-
-def convert_responses_request(openai_body, cfg):
-    """Translate an OpenAI Responses-API (/v1/responses) body into the native body."""
-    input_items = openai_body.get("input")
-    if isinstance(input_items, dict):
-        input_items = [input_items]
-    system_parts = []
-    instructions = openai_body.get("instructions")
-    if instructions:
-        system_parts.append(instructions if isinstance(instructions, str)
-                            else parts_to_text(instructions))
-    messages = responses_input_to_messages(input_items, system_parts)
-    system = "\n\n".join(p for p in system_parts if p)
-    tools = convert_responses_tools(openai_body.get("tools"))
-    tool_choice = convert_responses_tool_choice(openai_body.get("tool_choice"))
-
-    params = {
-        "model": catalog.resolve(openai_body.get("model"))
-                 or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
-        "messages": messages,
-        "system": system,
-        "stream": True,
-    }
-    if tools:
-        params["tools"] = tools
-    if tool_choice is not None:
-        params["toolChoice"] = tool_choice
-    max_tokens = openai_body.get("max_output_tokens") or openai_body.get("max_tokens")
-    if max_tokens is not None:
-        params["max_tokens"] = max_tokens
-    for key in ("temperature", "top_p", "stop"):
-        if openai_body.get(key) is not None:
-            params[key] = openai_body[key]
+    if req.get("top_p") is not None:
+        params["top_p"] = req["top_p"]
+    if req.get("reasoning_effort") is not None:
+        params["reasoning_effort"] = req["reasoning_effort"]
+    stop = req.get("stop")
+    if stop:
+        params["stop"] = stop if isinstance(stop, list) else [stop]
     return build_native_body(params, cfg)
 
 
 # ---------------------------------------------------------------------------
-# Anthropic Messages API (/v1/messages) request conversion
+# Native event stream -> OpenAI chunks
 # ---------------------------------------------------------------------------
 
 
-def anthropic_blocks_to_text(content):
-    """Flatten Anthropic content (string or block list) into plain text."""
-    if isinstance(content, str):
-        return content
-    out = []
-    for block in content or []:
-        if isinstance(block, str):
-            out.append(block)
-        elif isinstance(block, dict):
-            btype = block.get("type")
-            if btype == "text":
-                out.append(block.get("text", ""))
-            elif btype == "tool_result":
-                out.append(anthropic_blocks_to_text(block.get("content")))
-            elif btype in ("image", "document"):
-                out.append(f"[{btype}]")
-            elif "text" in block:
-                out.append(str(block.get("text", "")))
-    return "\n".join(t for t in out if t)
-
-
-def convert_anthropic_messages(messages):
-    """Convert Anthropic messages to native user/assistant-only messages.
-
-    tool_result blocks are flattened into "[tool result for <id>]" text (same
-    convention as the OpenAI path); tool_use blocks in assistant history are
-    kept as a short "[called tool ...]" marker so the model sees its own prior
-    actions.
-    """
-    native = []
-    for msg in messages or []:
-        if not isinstance(msg, dict):
+def iter_events(resp):
+    """Yield one native event dict per line. The stream is newline-delimited
+    JSON; `data:`/`event:`/comment framing is tolerated but not used."""
+    for line in resp.iter_lines(decode_unicode=False):
+        if not line:
             continue
-        role = msg.get("role")
-        if role not in ("user", "assistant"):
+        try:
+            text = line.decode("utf-8").strip()
+        except UnicodeDecodeError:
             continue
-        content = msg.get("content")
-        if isinstance(content, str):
-            native.append({"role": role, "content": content})
+        if not text or text.startswith(":") or text.startswith("event:"):
             continue
-        parts = []
-        for block in content or []:
-            if isinstance(block, str):
-                parts.append(block)
-                continue
-            if not isinstance(block, dict):
-                continue
-            btype = block.get("type")
-            if btype == "text":
-                parts.append(block.get("text", ""))
-            elif btype == "tool_result":
-                result_text = anthropic_blocks_to_text(block.get("content"))
-                parts.append(f"[tool result for {block.get('tool_use_id') or '?'}]\n{result_text}")
-            elif btype == "tool_use":
-                called_input = json.dumps(block.get("input") or {}, ensure_ascii=False)
-                parts.append(f"[called tool {block.get('name', '?')}({called_input})]")
-            elif btype in ("image", "document"):
-                parts.append(f"[{btype}]")
-        text = "\n".join(p for p in parts if p)
-        if text:
-            native.append({"role": role, "content": text})
-    return native
-
-
-def convert_anthropic_tools(tools):
-    """Pass Anthropic tool schemas through — they already match the native
-    {name, description, input_schema} shape. Built-in web_search/web_fetch
-    share the same type names, so they pass through untouched too."""
-    out = []
-    for tool in tools or []:
-        if not isinstance(tool, dict):
+        if text.startswith("data:"):
+            text = text[5:].strip()
+        if not text or text == "[DONE]":
             continue
-        ttype = tool.get("type")
-        if ttype in ("web_search_20250305", "web_fetch_20250910"):
-            out.append(tool)
-        elif tool.get("name"):
-            out.append({
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "input_schema": tool.get("input_schema")
-                                or {"type": "object", "properties": {}},
-            })
-    return out
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
 
 
-def convert_anthropic_tool_choice(tool_choice):
-    """Map Anthropic tool_choice ({type: auto|any|none|tool}) to the native
-    AI-SDK toolChoice value."""
-    if not isinstance(tool_choice, dict):
-        return None
-    ttype = tool_choice.get("type")
-    if ttype == "any":
-        return "required"
-    if ttype in ("auto", "none"):
-        return ttype
-    if ttype == "tool" and tool_choice.get("name"):
-        return {"type": "tool", "toolName": tool_choice["name"]}
-    return None
-
-
-def convert_anthropic_request(body, cfg):
-    """Translate an Anthropic Messages-API (/v1/messages) body into the native body."""
-    params = {
-        "model": catalog.resolve(body.get("model"))
-                 or cfg.get("default_model") or "deepseek/deepseek-v4-flash",
-        "messages": convert_anthropic_messages(body.get("messages")),
-        "system": anthropic_blocks_to_text(body.get("system")),
-        "stream": True,
-    }
-    tools = convert_anthropic_tools(body.get("tools"))
-    if tools:
-        params["tools"] = tools
-    tool_choice = convert_anthropic_tool_choice(body.get("tool_choice"))
-    if tool_choice is not None:
-        params["toolChoice"] = tool_choice
-    if body.get("max_tokens") is not None:
-        params["max_tokens"] = body["max_tokens"]
-    for key in ("temperature", "top_p"):
-        if body.get(key) is not None:
-            params[key] = body[key]
-    if body.get("stop_sequences"):
-        params["stop"] = body["stop_sequences"]
-    return build_native_body(params, cfg)
-
-
-# ---------------------------------------------------------------------------
-# Native response translation
-# ---------------------------------------------------------------------------
+def error_message(event):
+    err = event.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or json.dumps(err, ensure_ascii=False)
+    if isinstance(err, str):
+        return err
+    return event.get("message") or "upstream stream error"
 
 
 def map_finish_reason(reason):
-    """Native 'tool-calls' -> OpenAI 'tool_calls'."""
     return {
         "tool-calls": "tool_calls",
         "tool-calls-paused": "tool_calls",
-    }.get(reason, reason or "stop")
+        "tool_calls": "tool_calls",
+        "max-tokens": "length",
+        "max-tokens-paused": "length",
+        "max_output_tokens": "length",
+        "length": "length",
+    }.get(reason or "", "stop")
 
 
-def openai_usage(total_usage):
-    """Map native totalUsage to the OpenAI usage shape."""
-    return {
-        "prompt_tokens": total_usage.get("inputTokens"),
-        "completion_tokens": total_usage.get("outputTokens"),
-        "total_tokens": total_usage.get("totalTokens"),
+def openai_usage(total):
+    prompt, completion = total.get("inputTokens") or 0, total.get("outputTokens") or 0
+    usage = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total.get("totalTokens") or (prompt + completion),
     }
+    cached = (total.get("inputTokenDetails") or {}).get("cacheReadTokens")
+    if cached:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    reasoning = (total.get("outputTokenDetails") or {}).get("reasoningTokens")
+    if reasoning:
+        usage["completion_tokens_details"] = {"reasoning_tokens": reasoning}
+    return usage
 
 
 class Translator:
-    """Consumes native stream-part events, emits OpenAI chunk dicts.
+    """Consumes native events and emits OpenAI chunks.
 
-    Both the streaming path (write each chunk as SSE) and the buffered path
-    (collect everything, then build a single chat.completion) share this.
+    Streaming callers get one chunk per event; buffered callers get nothing
+    until `completion()`. Both paths share the accumulated state.
+
+    Events seen in practice: start / start-step / provider-metadata (ignored),
+    text-start|delta|end, reasoning-start|delta|end, tool-input-start|delta|end,
+    tool-call (the complete form), finish-step (per-step usage, ignored),
+    finish, error. Text and tool deltas are streamed as they arrive, so the
+    trailing complete `tool-call` only fills in anything the deltas missed.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, streaming):
         self.model = model
+        self.streaming = streaming
         self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
-        self.reasoning = []
         self.text = []
-        self.tool_calls = []   # {index, id, type, function:{name, arguments}}
-        self.tool_index = -1
+        self.reasoning = []
+        self.tool_calls = []   # [{id, name, args}]
+        self._by_id = {}       # upstream tool id -> index in tool_calls
         self.finish_reason = None
         self.usage = None
-        self._sent_role = False
-        self.upstream_error = None   # message from a native 'error' event, if any
+        self.finished = False
+        self.error = None
+        self._role_sent = False
+
+    # -- chunk builders ----------------------------------------------------
 
     def _chunk(self, delta, finish_reason=None, usage=None):
         chunk = {
@@ -667,67 +613,125 @@ class Translator:
             chunk["usage"] = usage
         return chunk
 
-    def _content_chunk(self, delta):
-        """Emit a delta chunk, guaranteeing the assistant role on the first one."""
-        if not self._sent_role:
+    def _delta(self, delta):
+        """Emit a delta chunk, attaching the assistant role to the first one."""
+        if not self._role_sent:
             delta = {"role": "assistant", **delta}
-            self._sent_role = True
+            self._role_sent = True
         return self._chunk(delta)
 
-    def on_event(self, obj):
-        """Translate one native event; return a list of OpenAI chunks to emit."""
-        etype = obj.get("type")
-        if etype == "error":
-            self.upstream_error = upstream_error_message(obj) or "upstream error"
-            return []
-        if etype == "reasoning-delta":
-            self.reasoning.append(obj.get("text", ""))
-            return [self._content_chunk({"reasoning_content": obj.get("text", "")})]
-        if etype == "text-start":
-            return [self._content_chunk({"content": ""})]
-        if etype == "text-delta":
-            self.text.append(obj.get("text", ""))
-            return [self._content_chunk({"content": obj.get("text", "")})]
-        if etype == "tool-input-start":
-            self.tool_index += 1
-            tc = {
-                "index": self.tool_index,
-                "id": obj.get("id", f"call_{self.tool_index}"),
-                "type": "function",
-                "function": {"name": obj.get("toolName", ""), "arguments": ""},
-            }
-            self.tool_calls.append(tc)
-            return [self._content_chunk({"tool_calls": [tc]})]
-        if etype == "tool-input-delta":
-            delta_text = obj.get("delta", "")
-            if 0 <= self.tool_index < len(self.tool_calls):
-                self.tool_calls[self.tool_index]["function"]["arguments"] += delta_text
-            return [self._chunk({
-                "tool_calls": [{"index": max(self.tool_index, 0),
-                                "function": {"arguments": delta_text}}],
-            })]
-        if etype == "finish":
-            self.finish_reason = map_finish_reason(obj.get("finishReason"))
-            total_usage = obj.get("totalUsage") or {}
-            self.usage = openai_usage(total_usage)
-            return [self._chunk({}, finish_reason=self.finish_reason, usage=self.usage)]
-        # start / start-step / finish-step / provider-metadata / tool-call -> nothing
-        return []
+    # -- event handling ----------------------------------------------------
 
-    def final_message(self):
-        message = {"role": "assistant", "content": "".join(self.text)}
+    def feed(self, event):
+        """Translate one native event into a list of OpenAI chunks to emit."""
+        etype = event.get("type")
+
+        if etype is None:
+            # A bare error envelope can arrive in place of a stream.
+            if event.get("error") or event.get("success") is False:
+                self.error = error_message(event)
+                self.finished = True
+            return []
+
+        if etype == "error":
+            self.error = error_message(event)
+            self.finished = True
+            return []
+
+        if etype == "text-delta":
+            text = event.get("text") or ""
+            self.text.append(text)
+            return [self._delta({"content": text})] if self.streaming else []
+
+        if etype == "reasoning-delta":
+            text = event.get("text") or ""
+            self.reasoning.append(text)
+            return [self._delta({"reasoning_content": text})] if self.streaming else []
+
+        if etype == "tool-input-start":
+            index = len(self.tool_calls)
+            call = {"id": event.get("id") or f"call_{index}",
+                    "name": event.get("toolName") or "", "args": ""}
+            self.tool_calls.append(call)
+            self._by_id[event.get("id")] = index
+            if not self.streaming:
+                return []
+            return [self._delta({"tool_calls": [{
+                "index": index, "id": call["id"], "type": "function",
+                "function": {"name": call["name"], "arguments": ""},
+            }]})]
+
+        if etype == "tool-input-delta":
+            index = self._by_id.get(event.get("id"))
+            delta = event.get("delta") or ""
+            if index is not None:
+                self.tool_calls[index]["args"] += delta
+            if not self.streaming:
+                return []
+            return [self._chunk({"tool_calls": [{
+                "index": index if index is not None else 0,
+                "function": {"arguments": delta},
+            }]})]
+
+        if etype == "tool-call":
+            return self._complete_tool_call(event)
+
+        if etype == "finish":
+            self.finish_reason = map_finish_reason(event.get("finishReason"))
+            self.usage = openai_usage(event.get("totalUsage") or {})
+            self.finished = True
+            if not self.streaming:
+                return []
+            return [self._chunk({}, finish_reason=self.finish_reason, usage=self.usage)]
+
+        return []  # start / start-step / text-start / text-end / tool-input-end / ...
+
+    def _complete_tool_call(self, event):
+        """The trailing complete `tool-call` event. Anything already streamed
+        from tool-input-* wins; this only fills in gaps."""
+        call_id = event.get("toolCallId") or event.get("id") or ""
+        name = event.get("toolName") or ""
+        raw = event.get("input", event.get("args", event.get("arguments")))
+        args = tool_args(raw)
+        index = self._by_id.get(call_id)
+        if index is not None:
+            call = self.tool_calls[index]
+            call["name"] = call["name"] or name
+            call["args"] = call["args"] or args
+            return []
+        index = len(self.tool_calls)
+        self.tool_calls.append({"id": call_id or f"call_{index}", "name": name, "args": args})
+        if call_id:
+            self._by_id[call_id] = index
+        if not self.streaming:
+            return []
+        return [self._delta({"tool_calls": [{
+            "index": index, "id": self.tool_calls[index]["id"], "type": "function",
+            "function": {"name": name, "arguments": args},
+        }]})]
+
+    def finalize(self):
+        """Terminal chunk for a stream that ended without a `finish` event, so
+        the client always sees a finish_reason."""
+        if self.finished:
+            return None
+        self.finished = True
+        self.finish_reason = self.finish_reason or "stop"
+        if not self.streaming:
+            return None
+        return self._chunk({}, finish_reason=self.finish_reason, usage=self.usage)
+
+    # -- buffered output ---------------------------------------------------
+
+    def completion(self):
+        message = {"role": "assistant", "content": "".join(self.text) or None}
         if self.reasoning:
             message["reasoning_content"] = "".join(self.reasoning)
         if self.tool_calls:
-            message["tool_calls"] = [
-                {"id": tc["id"], "type": "function",
-                 "function": {"name": tc["function"]["name"],
-                              "arguments": tc["function"]["arguments"]}}
-                for tc in self.tool_calls
-            ]
-        return message
-
-    def final_completion(self):
+            message["tool_calls"] = [{
+                "id": call["id"], "type": "function",
+                "function": {"name": call["name"], "arguments": call["args"] or "{}"},
+            } for call in self.tool_calls]
         return {
             "id": self.id,
             "object": "chat.completion",
@@ -735,1100 +739,276 @@ class Translator:
             "model": self.model,
             "choices": [{
                 "index": 0,
-                "message": self.final_message(),
+                "message": message,
                 "finish_reason": self.finish_reason or "stop",
             }],
-            "usage": self.usage or {
-                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-            },
+            "usage": self.usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
 
-def responses_usage(total_usage):
-    """Map native totalUsage to the OpenAI Responses-API usage shape."""
-    return {
-        "input_tokens": total_usage.get("inputTokens"),
-        "output_tokens": total_usage.get("outputTokens"),
-        "total_tokens": total_usage.get("totalTokens"),
-        "input_tokens_details": {"cached_tokens": total_usage.get("cachedInputTokens")},
-        "output_tokens_details": {"reasoning_tokens": total_usage.get("reasoningTokens")},
-    }
-
-
-class ResponsesTranslator:
-    """Consumes native stream-part events, emits OpenAI Responses-API SSE events.
-
-    Emits the standard event sequence the OpenAI SDK / Codex expect:
-    response.created -> response.in_progress -> (per output item:
-    output_item.added -> content_part/arguments deltas -> output_item.done)
-    -> response.completed. Reasoning is surfaced via reasoning_summary_text.
-    """
-
-    def __init__(self, model):
-        self.model = model
-        self.id = f"resp_{uuid.uuid4().hex[:24]}"
-        self.created_at = int(time.time())
-        self.reasoning = []
-        self.text = []
-        self.tool_calls = []   # {item_id, call_id, name, arguments, index}
-        self.items = []        # completed output items, in generation order
-        self.output_index = 0
-        self.finish_reason = None
-        self.usage = None
-        self._reasoning_id = None
-        self._reasoning_index = None
-        self._msg_id = None
-        self._msg_index = None
-        self._current_tool = None
-        self.completed = False   # True once a native 'finish' event is seen
-        self.upstream_error = None   # message from a native 'error' event, if any
-
-    def meta_response(self, status="in_progress"):
-        return {
-            "id": self.id,
-            "object": "response",
-            "created_at": self.created_at,
-            "status": status,
-            "model": self.model,
-            "output": [],
-        }
-
-    def _close_reasoning(self):
-        """Close the reasoning item if one is open; return its done events.
-
-        Mirrors the Anthropic path: the upstream emits text-start /
-        tool-input-start *before* reasoning-end, so a new output item can open
-        while the reasoning item is still in_progress. Items must close in
-        order, or the client SDK keeps the reasoning item open and the
-        response appears to stall.
-        """
-        if self._reasoning_id is None:
-            return []
-        text = "".join(self.reasoning)
-        item = {"id": self._reasoning_id, "type": "reasoning", "status": "completed",
-                "summary": [{"type": "summary_text", "text": text}],
-                "content": [{"type": "reasoning_text", "text": text}]}
-        self.items.append(item)
-        out = [
-            ("response.reasoning_summary_text.done", {
-                "item_id": self._reasoning_id, "output_index": self._reasoning_index,
-                "summary_index": 0, "summary": item["summary"],
-            }),
-            ("response.output_item.done", {
-                "output_index": self._reasoning_index, "item": item,
-            }),
-        ]
-        self._reasoning_id = None
-        return out
-
-    def pending_reasoning_stop(self):
-        """Events that close a reasoning item left open when the stream ends."""
-        return self._close_reasoning()
-
-    def on_event(self, obj):
-        """Translate one native event; return a list of (event_type, data) pairs."""
-        etype = obj.get("type")
-        if etype == "error":
-            self.upstream_error = upstream_error_message(obj) or "upstream error"
-            return []
-        if etype == "reasoning-delta":
-            self.reasoning.append(obj.get("text", ""))
-            out = []
-            if self._reasoning_id is None:
-                self._reasoning_index = self.output_index
-                self.output_index += 1
-                self._reasoning_id = f"rsn_{uuid.uuid4().hex[:16]}"
-                out.append(("response.output_item.added", {
-                    "output_index": self._reasoning_index,
-                    "item": {"id": self._reasoning_id, "type": "reasoning",
-                             "status": "in_progress",
-                             "summary": [{"type": "summary_text", "text": ""}],
-                             "content": [{"type": "reasoning_text", "text": ""}]},
-                }))
-            out.append(("response.reasoning_summary_text.delta", {
-                "item_id": self._reasoning_id, "output_index": self._reasoning_index,
-                "summary_index": 0, "delta": obj.get("text", ""),
-            }))
-            return out
-        if etype == "reasoning-end":
-            return self._close_reasoning()
-        if etype == "text-start":
-            out = self._close_reasoning()
-            self._msg_index = self.output_index
-            self.output_index += 1
-            self._msg_id = f"msg_{uuid.uuid4().hex[:16]}"
-            out += [
-                ("response.output_item.added", {
-                    "output_index": self._msg_index,
-                    "item": {"id": self._msg_id, "type": "message", "status": "in_progress",
-                             "role": "assistant", "content": []},
-                }),
-                ("response.content_part.added", {
-                    "item_id": self._msg_id, "output_index": self._msg_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []},
-                }),
-            ]
-            return out
-        if etype == "text-delta":
-            self.text.append(obj.get("text", ""))
-            return [("response.output_text.delta", {
-                "item_id": self._msg_id, "output_index": self._msg_index,
-                "content_index": 0, "delta": obj.get("text", ""),
-            })]
-        if etype == "text-end":
-            if self._msg_id is None:
-                return []
-            full = "".join(self.text)
-            item = {"id": self._msg_id, "type": "message", "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": full, "annotations": []}]}
-            self.items.append(item)
-            out = [
-                ("response.output_text.done", {
-                    "item_id": self._msg_id, "output_index": self._msg_index,
-                    "content_index": 0, "text": full,
-                }),
-                ("response.content_part.done", {
-                    "item_id": self._msg_id, "output_index": self._msg_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": full, "annotations": []},
-                }),
-                ("response.output_item.done", {
-                    "output_index": self._msg_index, "item": item,
-                }),
-            ]
-            self._msg_id = None
-            return out
-        if etype == "tool-input-start":
-            out = self._close_reasoning()
-            call_id = obj.get("id", f"call_{uuid.uuid4().hex[:16]}")
-            name = obj.get("toolName", "")
-            idx = self.output_index
-            self.output_index += 1
-            self._current_tool = {"item_id": call_id, "call_id": call_id, "name": name,
-                                  "arguments": "", "index": idx}
-            self.tool_calls.append(self._current_tool)
-            out.append(("response.output_item.added", {
-                "output_index": idx,
-                "item": {"id": call_id, "type": "function_call", "status": "in_progress",
-                         "call_id": call_id, "name": name, "arguments": ""},
-            }))
-            return out
-        if etype == "tool-input-delta":
-            if self._current_tool is None:
-                return []
-            self._current_tool["arguments"] += obj.get("delta", "")
-            return [("response.function_call_arguments.delta", {
-                "item_id": self._current_tool["item_id"],
-                "output_index": self._current_tool["index"],
-                "delta": obj.get("delta", ""),
-            })]
-        if etype == "tool-input-end":
-            if self._current_tool is None:
-                return []
-            tc = self._current_tool
-            item = {"id": tc["item_id"], "type": "function_call", "status": "completed",
-                    "call_id": tc["call_id"], "name": tc["name"],
-                    "arguments": tc["arguments"]}
-            self.items.append(item)
-            out = [
-                ("response.function_call_arguments.done", {
-                    "item_id": tc["item_id"], "output_index": tc["index"],
-                    "arguments": tc["arguments"],
-                }),
-                ("response.output_item.done", {
-                    "output_index": tc["index"], "item": item,
-                }),
-            ]
-            self._current_tool = None
-            return out
-        if etype == "finish":
-            self.finish_reason = map_finish_reason(obj.get("finishReason"))
-            self.usage = responses_usage(obj.get("totalUsage") or {})
-            self.completed = True
-            return [("response.completed", {
-                "type": "response.completed",
-                "response": self.final_response(status="completed"),
-            })]
-        return []
-
-    def final_response(self, status="completed"):
-        incomplete_details = None
-        if self.finish_reason == "length":
-            incomplete_details = {"reason": "max_output_tokens"}
-        return {
-            "id": self.id,
-            "object": "response",
-            "created_at": self.created_at,
-            "status": status,
-            "model": self.model,
-            "output": self.items,
-            "parallel_tool_calls": True,
-            "tools": [],
-            "tool_choice": "auto",
-            "usage": self.usage or {
-                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens_details": {"reasoning_tokens": 0},
-            },
-            "incomplete_details": incomplete_details,
-            "error": None,
-        }
-
-
-class AnthropicTranslator:
-    """Consumes native stream-part events, emits Anthropic Messages-API events.
-
-    Event sequence: message_start -> per content block (content_block_start ->
-    text_delta / input_json_delta -> content_block_stop) -> message_delta
-    (with stop_reason + usage) -> message_stop. Reasoning is surfaced as a
-    dedicated thinking block.
-    """
-
-    def __init__(self, model):
-        self.model = model
-        self.id = f"msg_{uuid.uuid4().hex[:24]}"
-        self.created_at = int(time.time())
-        self.reasoning = []
-        self.text = []
-        self.tool_calls = []   # {index, id, name, input}
-        self.stop_reason = None
-        self.usage = None
-        self.blocks = []       # completed blocks for the buffered path
-        self._block_index = -1     # index of the currently open block
-        self._block_type = None
-        self._tool = None
-        self.completed = False
-        self.upstream_error = None   # message from a native 'error' event, if any
-
-    # -- event construction helpers ----------------------------------------
-
-    def _start_event(self):
-        return ("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": self.id,
-                "type": "message",
-                "role": "assistant",
-                "model": self.model,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-            },
-        })
-
-    def _block_start(self, block):
-        """Open a new content block; returns the content_block_start event."""
-        self._block_index += 1
-        self._block_type = block["type"]
-        return ("content_block_start", {
-            "type": "content_block_start",
-            "index": self._block_index,
-            "content_block": block,
-        })
-
-    def _block_stop(self):
-        return ("content_block_stop", {
-            "type": "content_block_stop",
-            "index": self._block_index,
-        })
-
-    def anthropic_usage(self, total_usage):
-        return {
-            "input_tokens": total_usage.get("inputTokens") or 0,
-            "output_tokens": total_usage.get("outputTokens") or 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": total_usage.get("cachedInputTokens") or 0,
-        }
-
-    def final_message(self, stop_reason=None):
-        content = []
-        if self.reasoning:
-            content.append({"type": "thinking",
-                            "thinking": "".join(self.reasoning)})
-        content.append({"type": "text", "text": "".join(self.text)})
-        for tc in self.tool_calls:
-            content.append({"type": "tool_use", "id": tc["id"],
-                            "name": tc["name"], "input": tc["input"]})
-        return {
-            "id": self.id,
-            "type": "message",
-            "role": "assistant",
-            "model": self.model,
-            "content": content,
-            "stop_reason": stop_reason or self.stop_reason or "end_turn",
-            "stop_sequence": None,
-            "usage": self.usage or {
-                "input_tokens": 0, "output_tokens": 0,
-                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
-            },
-        }
-
-    # -- main entry ----------------------------------------------------------
-
-    def _close_open_block(self):
-        """Finalize whatever block is currently open and return the events that
-        close it (a content_block_stop, possibly preceded by nothing).
-
-        The upstream interleaves events -- it sends `text-start` / `tool-input-start`
-        *before* `reasoning-end` -- so a new block can be opened while the previous
-        one is still open. Leaving a block unterminated makes client SDKs (Claude
-        Code) keep the block open and stall the turn, so every block must be
-        closed before the next one opens (or before the stream ends).
-        """
-        out = []
-        if self._block_type is None or self._block_index < 0:
-            return out
-        btype = self._block_type
-        if btype == "thinking":
-            self.blocks.append({"type": "thinking", "thinking": "".join(self.reasoning)})
-        elif btype == "text":
-            self.blocks.append({"type": "text", "text": "".join(self.text)})
-        elif btype == "tool_use" and self._tool is not None:
-            try:
-                parsed = json.loads(self._tool["input_raw"]) if self._tool["input_raw"] else {}
-            except ValueError:
-                parsed = {}
-            self.tool_calls.append({"id": self._tool["id"], "name": self._tool["name"],
-                                    "input": parsed})
-            self.blocks.append({"type": "tool_use", "id": self._tool["id"],
-                                "name": self._tool["name"], "input": parsed})
-            self._tool = None
-        out.append(self._block_stop())
-        self._block_type = None
-        return out
-
-    def _open_block(self, block):
-        """Close any open block, then open `block`; returns the open events."""
-        out = self._close_open_block()
-        out.append(self._block_start(block))
-        return out
-
-    def pending_block_stop(self):
-        """Events that close the block still open when the upstream ends early."""
-        return self._close_open_block()
-
-    def on_event(self, obj):
-        """Translate one native event; return a list of (event_type, data)."""
-        etype = obj.get("type")
-        out = []
-        if etype == "error":
-            self.upstream_error = upstream_error_message(obj) or "upstream error"
-            return []
-        if etype == "reasoning-start":
-            out += self._open_block({"type": "thinking", "thinking": ""})
-        elif etype == "reasoning-delta":
-            if self._block_type != "thinking":
-                out += self._open_block({"type": "thinking", "thinking": ""})
-            self.reasoning.append(obj.get("text", ""))
-            out.append(("content_block_delta", {
-                "type": "content_block_delta", "index": self._block_index,
-                "delta": {"type": "thinking_delta", "thinking": obj.get("text", "")},
-            }))
-        elif etype == "reasoning-end":
-            if self._block_type == "thinking":
-                out += self._close_open_block()
-        elif etype == "text-start":
-            out += self._open_block({"type": "text", "text": ""})
-        elif etype == "text-delta":
-            if self._block_type != "text":
-                out += self._open_block({"type": "text", "text": ""})
-            self.text.append(obj.get("text", ""))
-            out.append(("content_block_delta", {
-                "type": "content_block_delta", "index": self._block_index,
-                "delta": {"type": "text_delta", "text": obj.get("text", "")},
-            }))
-        elif etype == "text-end":
-            if self._block_type == "text":
-                out += self._close_open_block()
-        elif etype == "tool-input-start":
-            call_id = obj.get("id", f"toolu_{uuid.uuid4().hex[:16]}")
-            name = obj.get("toolName", "")
-            self._tool = {"index": None, "id": call_id, "name": name, "input_raw": ""}
-            out += self._open_block({
-                "type": "tool_use", "id": call_id, "name": name, "input": {},
-            })
-            self._tool["index"] = self._block_index
-        elif etype == "tool-input-delta":
-            if self._tool is not None:
-                self._tool["input_raw"] += obj.get("delta", "")
-                out.append(("content_block_delta", {
-                    "type": "content_block_delta", "index": self._block_index,
-                    "delta": {"type": "input_json_delta",
-                              "partial_json": obj.get("delta", "")},
-                }))
-        elif etype == "tool-input-end":
-            if self._tool is not None:
-                try:
-                    parsed = json.loads(self._tool["input_raw"]) if self._tool["input_raw"] else {}
-                except ValueError:
-                    parsed = {}
-                self.tool_calls.append({"id": self._tool["id"], "name": self._tool["name"],
-                                        "input": parsed})
-                self.blocks.append({"type": "tool_use", "id": self._tool["id"],
-                                    "name": self._tool["name"], "input": parsed})
-                out.append(self._block_stop())
-                self._tool = None
-                self._block_type = None
-        elif etype == "finish":
-            reason = obj.get("finishReason")
-            # If the upstream reported a non-tool finish reason but actually
-            # emitted tool_use blocks, the turn is still waiting on the client
-            # to run them -- reporting end_turn would make Claude Code mark the
-            # task done mid-flight.
-            if self.tool_calls and map_finish_reason(reason) != "tool_calls":
-                self.stop_reason = "tool_use"
-            else:
-                self.stop_reason = "tool_use" if map_finish_reason(reason) == "tool_calls" else "end_turn"
-            if reason == "length":
-                self.stop_reason = "max_tokens"
-            self.usage = self.anthropic_usage(obj.get("totalUsage") or {})
-            self.completed = True
-            out.append(("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": self.stop_reason, "stop_sequence": None},
-                # Send the full usage (input + cache counts included), not just
-                # output_tokens: the Anthropic protocol only carries input_tokens
-                # in message_start, but the upstream only reports them in its
-                # final event -- too late to amend message_start. Usage trackers
-                # (CC-Switch, Claude Code) accept a corrected full usage in the
-                # final message_delta, which is how a 0-input message_start gets
-                # the real count.
-                "usage": self.usage,
-            }))
-            out.append(("message_stop", {"type": "message_stop"}))
-        return out
+def upstream_error(resp):
+    """Pull the human-readable message out of a failed upstream response."""
+    try:
+        body = resp.json()
+    except ValueError:
+        text = (resp.text or "").strip()
+        return text[:500] or f"HTTP {resp.status_code}"
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return err["message"]
+        if isinstance(err, str):
+            return err
+    return json.dumps(body, ensure_ascii=False)[:500]
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler
+# HTTP server
 # ---------------------------------------------------------------------------
-
-def build_models():
-    """Build the /v1/models catalog straight from the models.py registry.
-
-    The `.env` `models` list is no longer read: every visible model defined in
-    models.py is served (hidden promo entries stay hidden, mirroring the CLI
-    picker). Ids absent from the registry remain callable anyway, because
-    catalog.resolve() passes unknown ids through unchanged.
-    """
-    return catalog.openai_catalog()
-
-
-def iter_sse_lines(resp):
-    """Yield upstream SSE lines decoded as UTF-8, regardless of Content-Type.
-
-    requests' decode_unicode=True falls back to ISO-8859-1 when the response
-    has no charset (typical for text/event-stream), which garbles non-ASCII
-    text ("ä½ å¥½" mojibake). Read bytes and decode explicitly instead.
-    """
-    for raw in resp.iter_lines():
-        if raw is None:
-            continue
-        yield raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-
-
-def error_envelope(status, message, code=None, type_="invalid_request_error"):
-    return {"error": {"message": message, "type": type_, "code": code, "status": status}}
-
-
-def upstream_error_message(obj):
-    """Pull a human-readable message out of a native error event, if any.
-
-    The upstream may end a stream with an explicit {'type': 'error', ...}
-    event before closing; its message is the real reason (rate limit, model
-    hiccup, ...) and beats the generic 'stream ended without finish' text.
-    """
-    err = obj.get("error")
-    if isinstance(err, dict):
-        return err.get("message") or err.get("code") or json.dumps(err, ensure_ascii=False)
-    if err:
-        return str(err)
-    return obj.get("message") or None
-
-
-def log_diag(prefix, **fields):
-    """One-line stderr diagnostic for stream-end / failure post-mortems."""
-    parts = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
-    print(f"[{prefix}] {parts}", file=sys.stderr, flush=True)
-
-
-def upstream_error_envelope(upstream_error):
-    """Translate the native {'success': false, 'error': {...}} shape to OpenAI's."""
-    err = upstream_error.get("error", {}) if isinstance(upstream_error, dict) else {}
-    status = err.get("status") or 502
-    return error_envelope(
-        status,
-        err.get("message") or "upstream request failed",
-        code=err.get("code"),
-        type_="upstream_error",
-    ), status
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "CommandCodeBridge/1.0"
+    server_version = "command-code-bridge/2.0"
+    cfg = None  # set in main()
 
-    # -- helpers -----------------------------------------------------------
+    # -- plumbing ----------------------------------------------------------
 
-    def _cors_headers(self):
+    def log_message(self, fmt, *args):
+        debug(self.cfg, f"[http] {self.address_string()} {fmt % args}")
+
+    def _read_body(self):
+        length = self.headers.get("Content-Length")
+        if length:
+            return self.rfile.read(int(length))
+        if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            return self._read_chunked()
+        return b""
+
+    def _read_chunked(self):
+        chunks = []
+        while True:
+            line = self.rfile.readline().strip()
+            if not line:
+                break
+            size = int(line.split(b";")[0], 16)
+            if size == 0:
+                self.rfile.readline()
+                break
+            chunks.append(self.rfile.read(size))
+            self.rfile.read(2)  # trailing CRLF
+        return b"".join(chunks)
+
+    def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type, x-api-key")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
-    def _send_json(self, status, obj, extra_headers=None):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    def _send_json(self, status, obj):
+        payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self._cors_headers()
-        for key, value in (extra_headers or {}).items():
-            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self._cors()
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(payload)
 
-    def _read_json_body(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0) or 0)
-        except ValueError:
-            length = 0
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
-        if not raw:
-            return {}
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            return None
+    def _send_error(self, status, message, etype="invalid_request_error"):
+        self._send_json(status, {"error": {"message": message, "type": etype}})
 
-    def _close_upstream(self, resp):
+    # -- SSE ---------------------------------------------------------------
+
+    def _sse_open(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self._cors()
+        self.end_headers()
+
+    def _sse_frame(self, obj):
+        self._sse_raw("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
+
+    def _sse_raw(self, text):
+        data = text.encode("utf-8")
+        self.wfile.write(b"%X\r\n" % len(data) + data + b"\r\n")
+        self.wfile.flush()
+
+    def _sse_end(self):
         try:
-            resp.close()
-        except Exception:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except OSError:
             pass
 
-    def _client_api_key(self):
-        """Extract a client-supplied upstream key from the incoming request.
+    # -- routes ------------------------------------------------------------
 
-        Anthropic clients (Claude Code) send it as `x-api-key`; OpenAI clients
-        as `Authorization: Bearer <key>`. Returns None when the caller gave no
-        key, so the server pool can supply one instead.
-        """
-        xkey = (self.headers.get("x-api-key") or "").strip()
-        if xkey:
-            return xkey
-        auth = (self.headers.get("Authorization") or "").strip()
-        if auth[:7].lower() == "bearer " and auth[7:].strip():
-            return auth[7:].strip()
-        return None
-
-    def _upstream_post(self, native_body, cfg, client_key=None):
-        """POST to the command-code endpoint; retry transient failures.
-
-        The Bearer key is chosen per request: a pinned `.env auth_token` always
-        wins; otherwise a client-supplied key (x-api-key / Authorization) is
-        forwarded upstream; otherwise the next key in the round-robin pool.
-
-        Nothing has been sent to the client yet at this stage, so a connect or
-        header-read timeout (exception) or a 5xx reply (overloaded / hiccup)
-        is retried with short backoff -- a fresh, stateless generation is a
-        safe retry. Auth/4xx replies are permanent and passed through unchanged.
-        """
-        if cfg.get("key_pinned"):
-            key = cfg["auth_token"]
-        else:
-            key = (client_key or "").strip() or cfg["key_pool"].next()
-        headers = dict(UPSTREAM_HEADERS)
-        headers["Authorization"] = f"Bearer {key}"
-        last_exc = None
-        last_resp = None
-        for attempt in range(1, UPSTREAM_RETRIES + 1):
-            try:
-                resp = requests.post(
-                    cfg["base_url"],
-                    json=native_body,
-                    headers=headers,
-                    stream=True,
-                    timeout=(10, 600),
-                    proxies=cfg.get("proxies"),
-                )
-            except requests.RequestException as exc:
-                last_exc = exc
-                resp = None
-            else:
-                last_resp = resp
-                # Permanent client/authorization errors surface as-is.
-                if resp.status_code < 500:
-                    return resp
-                # 5xx: retry unless this was the last attempt.
-                if attempt >= UPSTREAM_RETRIES:
-                    return resp
-                self._close_upstream(resp)
-            if attempt < UPSTREAM_RETRIES:
-                time.sleep(min(0.5 * (2 ** (attempt - 1)), 3.0))
-        # All attempts failed on exceptions -> the upstream is unreachable.
-        log_diag("upstream:post-failed",
-                 exc=type(last_exc).__name__,
-                 detail=str(last_exc)[:300] if last_exc is not None else None)
-        self._send_json(502, error_envelope(
-            502, f"upstream request failed: {last_exc}", code="upstream_unreachable",
-            type_="upstream_error"))
-        return None
-
-    def _upstream_ok(self, resp):
-        """Return True if the upstream response is usable; else reply with an
-        OpenAI error envelope and return False."""
-        if resp.status_code == 200:
+    def _authorized(self):
+        """Optional proxy-level gate: `.env api_key` requires the client to
+        present that exact bearer token (or x-api-key)."""
+        want = self.cfg["api_key"]
+        if not want:
             return True
-        try:
-            upstream_body = resp.json()
-        except ValueError:
-            upstream_body = None
-        self._close_upstream(resp)
-        if upstream_body:
-            err, status = upstream_error_envelope(upstream_body)
-        else:
-            err, status = (
-                error_envelope(resp.status_code,
-                               f"upstream returned HTTP {resp.status_code}",
-                               code="upstream_error", type_="upstream_error"),
-                resp.status_code)
-        self._send_json(status, err)
-        return False
-
-    # -- routes -------------------------------------------------------------
+        got = (self.headers.get("x-api-key") or "").strip()
+        if not got:
+            auth = self.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                got = auth[7:].strip()
+        return hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
 
     def do_OPTIONS(self):
-        self.send_response(204)
-        self._cors_headers()
+        self.send_response(200)
+        self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
-        if self.path.split("?")[0].rstrip("/") == "/v1/models":
-            self._send_json(200, {"object": "list", "data": self.server.models})
-        else:
-            self._send_json(404, error_envelope(404, "Not Found", code="not_found"))
+        path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+        if path in ("/health", "/healthz"):
+            self._send_json(200, {
+                "status": "ok",
+                "upstream": self.cfg["base_url"],
+                "models_url": self.cfg["models_url"],
+                "keys": len(self.cfg["api_keys"]),
+                "proxy": self.cfg["proxy"] or None,
+            })
+            return
+        if path == "/v1/models":
+            self._handle_models()
+            return
+        self._send_error(404, f"Unknown path: {self.path}", "not_found_error")
 
     def do_POST(self):
-        path = self.path.split("?")[0].rstrip("/")
-        if path == "/v1/chat/completions":
-            self._handle_chat_completions()
-        elif path == "/v1/responses":
-            self._handle_responses()
-        elif path == "/v1/messages":
-            self._handle_messages()
-        else:
-            self._send_json(404, error_envelope(404, "Not Found", code="not_found"))
-
-    # -- chat completions ----------------------------------------------------
-
-    def _handle_chat_completions(self):
-        cfg = self.server.cfg
-        openai_body = self._read_json_body()
-        if openai_body is None:
-            self._send_json(400, error_envelope(400, "Invalid JSON body"))
+        # Drain the body first: on an early 401/404 the request would otherwise
+        # be left unread and the next request on this keep-alive connection
+        # would be parsed as its body.
+        raw = self._read_body()
+        path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+        if path != "/v1/chat/completions":
+            self._send_error(404, f"Unknown path: {self.path}", "not_found_error")
             return
+        self._handle_chat(raw)
 
-        native_body = convert_openai_request(openai_body, cfg)
-        client_wants_stream = bool(openai_body.get("stream"))
+    # -- handlers ----------------------------------------------------------
 
-        resp = self._upstream_post(native_body, cfg, self._client_api_key())
-        if resp is None or not self._upstream_ok(resp):
+    def _handle_models(self):
+        if not self._authorized():
+            self._send_error(401, "Missing or invalid proxy API key", "authentication_error")
             return
-
-        translator = Translator(openai_body.get("model")
-                                or cfg.get("default_model") or "deepseek/deepseek-v4-flash")
-
-        if client_wants_stream:
-            self._stream_response(resp, translator)
-        else:
-            self._buffer_response(resp, translator)
-
-    def _handle_responses(self):
-        cfg = self.server.cfg
-        openai_body = self._read_json_body()
-        if openai_body is None:
-            self._send_json(400, error_envelope(400, "Invalid JSON body"))
-            return
-
-        native_body = convert_responses_request(openai_body, cfg)
-        client_wants_stream = bool(openai_body.get("stream"))
-
-        resp = self._upstream_post(native_body, cfg, self._client_api_key())
-        if resp is None or not self._upstream_ok(resp):
-            return
-
-        translator = ResponsesTranslator(openai_body.get("model")
-                                         or cfg.get("default_model") or "deepseek/deepseek-v4-flash")
-
-        if client_wants_stream:
-            self._stream_responses(resp, translator)
-        else:
-            self._buffer_responses(resp, translator)
-
-    # -- Anthropic messages --------------------------------------------------
-
-    def _anthropic_error(self, status, message, err_type="invalid_request_error"):
-        """Anthropic-shaped error body."""
-        self._send_json(status, {"type": "error",
-                                 "error": {"type": err_type, "message": message}})
-
-    def _upstream_ok_anthropic(self, resp):
-        """Like _upstream_ok but replies with an Anthropic error envelope."""
-        if resp.status_code == 200:
-            return True
         try:
-            upstream_body = resp.json()
-        except ValueError:
-            upstream_body = None
-        self._close_upstream(resp)
-        if upstream_body and isinstance(upstream_body, dict) and upstream_body.get("error"):
-            err = upstream_body["error"]
-            message = err.get("message") or "upstream request failed"
-            status = err.get("status") or resp.status_code
-        else:
-            message = f"upstream returned HTTP {resp.status_code}"
-            status = resp.status_code
-        self._anthropic_error(status, message, err_type="api_error")
-        return False
+            payload = get_models(self.cfg)
+        except Exception as exc:
+            self._send_error(502, f"Failed to fetch model list: {exc}", "upstream_error")
+            return
+        self._send_json(200, payload)
 
-    def _handle_messages(self):
-        cfg = self.server.cfg
-        body = self._read_json_body()
-        if body is None:
-            self._anthropic_error(400, "Invalid JSON body")
+    def _handle_chat(self, raw):
+        if not self._authorized():
+            self._send_error(401, "Missing or invalid proxy API key", "authentication_error")
             return
 
-        native_body = convert_anthropic_request(body, cfg)
-        client_wants_stream = bool(body.get("stream"))
-
-        resp = self._upstream_post(native_body, cfg, self._client_api_key())
-        if resp is None:
-            return
-        # _upstream_post already replied on connection failure; _upstream_ok
-        # would reply in OpenAI shape, so use the Anthropic variant instead.
-        if not self._upstream_ok_anthropic(resp):
-            return
-
-        translator = AnthropicTranslator(body.get("model")
-                                         or cfg.get("default_model")
-                                         or "deepseek/deepseek-v4-flash")
-
-        if client_wants_stream:
-            self._stream_anthropic(resp, translator)
-        else:
-            self._buffer_anthropic(resp, translator)
-
-    def _write_anthropic_event(self, event_type, data):
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
-        self.wfile.write(b"data: " + payload + b"\n\n")
-        self.wfile.flush()
-
-    def _stream_anthropic(self, resp, translator):
-        self._sse_headers()
-        t0 = time.time()
         try:
-            self._write_anthropic_event(*translator._start_event())
-            for line in iter_sse_lines(resp):
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                for event_type, data in translator.on_event(obj):
-                    self._write_anthropic_event(event_type, data)
-            # The upstream stream ended without a native 'finish' event. Normal
-            # upstream responses always end with one, so its absence means the
-            # response was cut off (dropped connection, upstream hiccup) --
-            # NOT a clean completion. Close any still-open block first, then
-            # surface an error. Masking it as stop_reason end_turn would make
-            # Claude Code mark the turn done mid-task with a partial result
-            # ("shows done, but the task has no result").
-            if not translator.completed:
-                log_diag("anthropic:truncated",
-                         elapsed=f"{time.time() - t0:.1f}s",
-                         reasoning=len("".join(translator.reasoning)),
-                         text=len("".join(translator.text)),
-                         blocks=len(translator.blocks),
-                         tools=len(translator.tool_calls),
-                         upstream_error=translator.upstream_error)
-                for event_type, data in translator.pending_block_stop():
-                    self._write_anthropic_event(event_type, data)
-                reason = (translator.upstream_error
-                          or "upstream stream ended before a finish event "
-                             "(response truncated)")
-                self._write_anthropic_event("error", {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": reason},
-                })
-            self.close_connection = True
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client went away; stop pulling upstream (don't waste tokens)
-        except requests.RequestException as exc:
-            log_diag("anthropic:stream-failed", exc=type(exc).__name__,
-                     detail=str(exc)[:300])
+            req = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._send_error(400, f"Invalid JSON body: {exc}")
+            return
+        if not isinstance(req, dict):
+            self._send_error(400, "Request body must be a JSON object")
+            return
+        if not isinstance(req.get("messages"), list) or not req["messages"]:
+            self._send_error(400, "Missing required field: messages")
+            return
+
+        streaming = req.get("stream") is True
+        model = req.get("model") or self.cfg["default_model"]
+        try:
+            native = convert_request(req, self.cfg)
+        except Exception as exc:
+            self._send_error(400, f"Request conversion failed: {exc}")
+            return
+
+        debug(self.cfg, f"[chat] model={model} stream={streaming} "
+                        f"messages={len(native['params']['messages'])} "
+                        f"tools={len(native['params'].get('tools', []))}")
+
+        client_key = client_key_from_headers(self.headers)
+        last_error = None
+
+        for attempt in range(MAX_ATTEMPTS):
+            if attempt:
+                time.sleep(0.5 * (2 ** (attempt - 1)))
+            key = pick_upstream_key(self.cfg, client_key)
+            debug(self.cfg, f"[chat] attempt {attempt + 1}/{MAX_ATTEMPTS} key={mask(key) or '(none)'}")
             try:
-                self._write_anthropic_event("error", {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": str(exc)},
-                })
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        except Exception as exc:  # noqa: BLE001 -- a broken stream must never
-            try:                  # end with a bare disconnect
-                self._write_anthropic_event("error", {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": str(exc)},
-                })
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                resp = SESSION.post(
+                    self.cfg["base_url"],
+                    json=native,
+                    headers=upstream_headers(key),
+                    stream=True,
+                    timeout=(self.cfg["connect_timeout"], self.cfg["read_timeout"]),
+                    proxies=self.cfg["proxies"],
+                )
+            except requests.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                debug(self.cfg, f"[chat] transport error: {last_error}")
+                continue
+
+            if resp.status_code == 200:
+                if streaming:
+                    self._stream(resp, model)
+                else:
+                    self._buffered(resp, model)
+                return
+
+            last_error = upstream_error(resp)
+            resp.close()
+            debug(self.cfg, f"[chat] upstream HTTP {resp.status_code}: {last_error}")
+            if resp.status_code in RETRY_STATUS and attempt < MAX_ATTEMPTS - 1:
+                continue
+            self._send_error(resp.status_code, last_error, "upstream_error")
+            return
+
+        self._send_error(502, f"Upstream request failed after {MAX_ATTEMPTS} attempts: "
+                              f"{last_error}", "upstream_error")
+
+    def _stream(self, resp, model):
+        translator = Translator(model, streaming=True)
+        self._sse_open()
+        try:
+            for event in iter_events(resp):
+                for chunk in translator.feed(event):
+                    self._sse_frame(chunk)
+                if translator.finished:
+                    break
+            final = translator.finalize()
+            if final:
+                self._sse_frame(final)
+            if translator.error:
+                self._sse_frame({"error": {"message": translator.error,
+                                           "type": "upstream_error"}})
+            self._sse_raw("data: [DONE]\n\n")
+        except OSError:
+            # Client hung up mid-stream; nothing left to say to it.
+            debug(self.cfg, "[chat] client disconnected during stream")
         finally:
-            self._close_upstream(resp)
+            resp.close()
+            self._sse_end()
 
-    def _buffer_anthropic(self, resp, translator):
+    def _buffered(self, resp, model):
+        translator = Translator(model, streaming=False)
         try:
-            for line in iter_sse_lines(resp):
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                translator.on_event(obj)
-            self._close_upstream(resp)
-        except requests.RequestException as exc:
-            self._close_upstream(resp)
-            self._anthropic_error(502, f"upstream stream failed: {exc}",
-                                  err_type="api_error")
-            return
-        # A truncated upstream (no native 'finish') is not a completed turn;
-        # don't hand the client a 200 that looks finished.
-        if not translator.completed:
-            reason = (translator.upstream_error
-                      or "upstream stream ended before a finish event "
-                         "(response truncated)")
-            log_diag("anthropic-buffer:truncated",
-                     reasoning=len("".join(translator.reasoning)),
-                     text=len("".join(translator.text)),
-                     blocks=len(translator.blocks),
-                     tools=len(translator.tool_calls),
-                     upstream_error=translator.upstream_error)
-            self._anthropic_error(502, reason, err_type="api_error")
-            return
-        self._send_json(200, translator.final_message())
-
-    # -- streaming helpers --------------------------------------------------
-
-    def _sse_headers(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-    def _write_sse(self, chunk):
-        if chunk is None:
-            self.wfile.write(b"data: [DONE]\n\n")
-        else:
-            payload = json.dumps(chunk, ensure_ascii=False).encode("utf-8")
-            self.wfile.write(b"data: " + payload + b"\n\n")
-        self.wfile.flush()
-
-    def _write_sse_event(self, event_type, data):
-        # Responses-API SSE clients (openai SDK / codex) dispatch on the
-        # top-level `type` field inside the JSON data, NOT on the `event:`
-        # header -- a payload without it is silently dropped and the client
-        # reports "stream ended before response.completed". Guarantee every
-        # event carries its type (the Anthropic payloads already include it).
-        if "type" not in data:
-            data = {"type": event_type, **data}
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.wfile.write(f"event: {event_type}\n".encode("utf-8"))
-        self.wfile.write(b"data: " + payload + b"\n\n")
-        self.wfile.flush()
-
-    def _stream_response(self, resp, translator):
-        self._sse_headers()
-        t0 = time.time()
-        try:
-            for line in iter_sse_lines(resp):
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                for chunk in translator.on_event(obj):
-                    self._write_sse(chunk)
-            # A stream that ended without a native 'finish' event was cut off,
-            # not completed. Sending [DONE] would make chat clients treat a
-            # truncated run as a finished task -- the same masking bug as the
-            # Anthropic path. Surface an error chunk instead.
-            if translator.finish_reason is None:
-                reason = (translator.upstream_error
-                          or "upstream stream ended before a finish event "
-                             "(response truncated)")
-                log_diag("chat:truncated",
-                         elapsed=f"{time.time() - t0:.1f}s",
-                         reasoning=len("".join(translator.reasoning)),
-                         text=len("".join(translator.text)),
-                         tools=len(translator.tool_calls),
-                         upstream_error=translator.upstream_error)
-                self._write_sse({"error": {"message": reason, "type": "upstream_error",
-                                           "code": "upstream_error"}})
-            else:
-                self._write_sse(None)  # data: [DONE]
-            # Close the connection so clients (curl -N, HTTP/1.1) see EOF.
-            self.close_connection = True
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client went away; stop pulling upstream (don't waste tokens)
-        except requests.RequestException as exc:
-            log_diag("chat:stream-failed", exc=type(exc).__name__,
-                     detail=str(exc)[:300])
-            try:
-                self._write_sse({"error": {"message": str(exc), "type": "upstream_error",
-                                           "code": "upstream_error"}})
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            for event in iter_events(resp):
+                translator.feed(event)
+                if translator.finished:
+                    break
         finally:
-            self._close_upstream(resp)
-
-    def _stream_responses(self, resp, translator):
-        self._sse_headers()
-        t0 = time.time()
-        try:
-            self._write_sse_event("response.created",
-                                  {"type": "response.created",
-                                   "response": translator.meta_response("in_progress")})
-            self._write_sse_event("response.in_progress",
-                                  {"type": "response.in_progress",
-                                   "response": translator.meta_response("in_progress")})
-            for line in iter_sse_lines(resp):
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                for event_type, data in translator.on_event(obj):
-                    self._write_sse_event(event_type, data)
-            # Upstream ended without a native 'finish' event -- that means the
-            # response was cut off, not completed. Close any still-open
-            # reasoning item, then report failure; a bare response.completed
-            # would make codex treat a truncated run as a finished task.
-            if not translator.completed:
-                log_diag("responses:truncated",
-                         elapsed=f"{time.time() - t0:.1f}s",
-                         reasoning=len("".join(translator.reasoning)),
-                         text=len("".join(translator.text)),
-                         tools=len(translator.tool_calls),
-                         upstream_error=translator.upstream_error)
-                for event_type, data in translator.pending_reasoning_stop():
-                    self._write_sse_event(event_type, data)
-                reason = (translator.upstream_error
-                          or "upstream stream ended before a finish event "
-                             "(response truncated)")
-                self._write_sse_event("response.failed", {
-                    "type": "response.failed",
-                    "response": translator.final_response(status="failed"),
-                    "error": {"code": "upstream_error", "message": reason},
-                })
-            # Close the connection so clients see EOF after response.completed.
-            self.close_connection = True
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client went away; stop pulling upstream (don't waste tokens)
-        except requests.RequestException as exc:
-            try:
-                self._write_sse_event("response.failed", {
-                    "type": "response.failed",
-                    "response": translator.final_response(status="failed"),
-                    "error": {"code": "upstream_error", "message": str(exc)},
-                })
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        except Exception as exc:  # noqa: BLE001 -- a broken stream must never
-            try:                  # end with a bare disconnect
-                self._write_sse_event("response.failed", {
-                    "type": "response.failed",
-                    "response": translator.final_response(status="failed"),
-                    "error": {"code": "translation_error", "message": str(exc)},
-                })
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        finally:
-            self._close_upstream(resp)
-
-    def _buffer_response(self, resp, translator):
-        try:
-            for line in iter_sse_lines(resp):
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                translator.on_event(obj)
-            self._close_upstream(resp)
-        except requests.RequestException as exc:
-            self._close_upstream(resp)
-            self._send_json(502, error_envelope(
-                502, f"upstream stream failed: {exc}", code="upstream_error",
-                type_="upstream_error"))
+            resp.close()
+        if translator.error:
+            self._send_error(502, translator.error, "upstream_error")
             return
-        # No native finish event seen -> the upstream stream was cut off, not
-        # completed; don't hand the client a 200 that looks finished.
-        if translator.finish_reason is None:
-            reason = (translator.upstream_error
-                      or "upstream stream ended before a finish event "
-                         "(response truncated)")
-            log_diag("chat-buffer:truncated",
-                     reasoning=len("".join(translator.reasoning)),
-                     text=len("".join(translator.text)),
-                     tools=len(translator.tool_calls),
-                     upstream_error=translator.upstream_error)
-            self._send_json(502, error_envelope(
-                502, reason, code="upstream_error", type_="upstream_error"))
-            return
-        self._send_json(200, translator.final_completion())
-
-    def _buffer_responses(self, resp, translator):
-        try:
-            for line in iter_sse_lines(resp):
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                translator.on_event(obj)
-            self._close_upstream(resp)
-        except requests.RequestException as exc:
-            self._close_upstream(resp)
-            self._send_json(502, error_envelope(
-                502, f"upstream stream failed: {exc}", code="upstream_error",
-                type_="upstream_error"))
-            return
-        # No native finish event seen -> truncated, not completed.
-        if not translator.completed:
-            reason = (translator.upstream_error
-                      or "upstream stream ended before a finish event "
-                         "(response truncated)")
-            log_diag("responses-buffer:truncated",
-                     reasoning=len("".join(translator.reasoning)),
-                     text=len("".join(translator.text)),
-                     tools=len(translator.tool_calls),
-                     upstream_error=translator.upstream_error)
-            self._send_json(502, error_envelope(
-                502, reason, code="upstream_error", type_="upstream_error"))
-            return
-        self._send_json(200, translator.final_response(status="completed"))
+        self._send_json(200, translator.completion())
 
 
 # ---------------------------------------------------------------------------
@@ -1837,32 +1017,36 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    cfg = get_config()
-    server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])), BridgeHandler)
-    server.cfg = cfg
-    server.models = build_models()
-    print(f"[command-code bridge] listening on http://{cfg['host']}:{cfg['port']}")
-    print(f"[command-code bridge] upstream: {cfg['base_url']}")
+    cfg = load_config()
+    BridgeHandler.cfg = cfg
+
     if cfg["api_keys"]:
-        print(f"[command-code bridge] auth: {len(cfg['api_keys'])} key(s) from {cfg['key_source']}"
-              + (" [pinned: overrides client keys]" if cfg["key_pinned"] else
-                 " [client x-api-key / Authorization takes precedence]"))
+        print(f"[bridge] upstream keys: {len(cfg['api_keys'])} from {cfg['key_source']}"
+              + (" (pinned)" if cfg["key_pinned"] else " (round-robin)"))
+        for key in cfg["api_keys"]:
+            print(f"[bridge]   {mask(key)}")
     else:
-        print("[command-code bridge] auth: no server key — relying on client-supplied keys")
-    print(f"[command-code bridge] default model: {cfg['default_model']}")
-    if cfg.get("proxies"):
-        print(f"[command-code bridge] proxy: {cfg['proxy']}")
+        print("[bridge] upstream keys: none — only client-supplied 'user_*' keys will work")
+    print(f"[bridge] generate endpoint: {cfg['base_url']}")
+    print(f"[bridge] models endpoint:   {cfg['models_url']}")
+    print(f"[bridge] default model:     {cfg['default_model']}")
+    if cfg["proxy"]:
+        print(f"[bridge] outbound proxy:    {cfg['proxy']}")
     else:
-        print("[command-code bridge] proxy: none (direct connection)")
-    print(f"[command-code bridge] models catalog ({len(server.models)}): "
-          + ", ".join(m["id"] for m in server.models))
-    print("[command-code bridge] endpoints: POST /v1/chat/completions, POST /v1/responses, "
-          "POST /v1/messages (Anthropic), GET /v1/models")
+        print("[bridge] outbound proxy:    none (uses HTTP_PROXY/HTTPS_PROXY if set)")
+    if cfg["api_key"]:
+        print("[bridge] client auth:       required (Authorization: Bearer <api_key>)")
+
+    server = ThreadingHTTPServer((cfg["host"], cfg["port"]), BridgeHandler)
+    server.daemon_threads = True
+    print(f"[bridge] listening on http://{cfg['host']}:{cfg['port']}/v1  "
+          f"(Ctrl+C to stop)\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[command-code bridge] shutting down")
-        server.shutdown()
+        print("\n[bridge] shutting down")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
