@@ -375,10 +375,19 @@ def load_config():
 
 
 def debug(cfg, *parts):
+    """Chatty per-attempt tracing — gated behind DEBUG so it never becomes
+    permanent log spam in normal operation."""
     if cfg["debug"]:
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] "
-                         + " ".join(str(p) for p in parts) + "\n")
-        sys.stderr.flush()
+        log_line(*parts)
+
+
+def log_line(*parts):
+    """Always printed. Lifecycle events and every failure path go through here:
+    a proxy that fails silently is worse than one that fails loudly, and the
+    default (no DEBUG) still has to say what happened."""
+    sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] "
+                     + " ".join(str(p) for p in parts) + "\n")
+    sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -1300,6 +1309,22 @@ class Translator:
             return None
         return self._chunk({}, finish_reason=self.finish_reason, usage=self.usage)
 
+    def end_turn(self, reason="length"):
+        """Close out a truncated stream without claiming it was complete: the
+        assistant turn is marked unfinished and, when streaming, a terminal
+        chunk carries a non-"stop" reason so a client can tell the answer was
+        cut short rather than finished."""
+        self.finished = True
+        self.finish_reason = reason
+        if self.streaming:
+            self._pending = self._chunk({}, finish_reason=reason, usage=self.usage)
+
+    def take_ending(self):
+        """Return (and clear) the chunk end_turn prepared, if any."""
+        chunk = getattr(self, "_pending", None)
+        self._pending = None
+        return chunk
+
     # -- buffered output ---------------------------------------------------
 
     def completion(self):
@@ -1354,7 +1379,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
     # -- plumbing ----------------------------------------------------------
 
     def log_message(self, fmt, *args):
-        debug(self.cfg, f"[http] {self.address_string()} {fmt % args}")
+        # One line per request at INFO-equivalent level; the per-attempt tracing
+        # inside a chat stays behind DEBUG, but a request that reached this
+        # server is always worth a line — silence is what makes a proxy hard to
+        # diagnose.
+        log_line(f"[http] {self.address_string()} {fmt % args}")
 
     def _read_body(self):
         length = self.headers.get("Content-Length")
@@ -1503,6 +1532,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # Every key is hard-limited: answer locally instead of hammering upstream.
         if in_hard_limit_cooldown():
             retry_after = int(cooldown_remaining()) + 1
+            log_line(f"[chat] 硬限流冷却中，本地返回 429（{retry_after}s）")
             self.send_response(429)
             self.send_header("Retry-After", str(retry_after))
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1524,16 +1554,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._send_error(400, f"Request conversion failed: {exc}")
             return
 
-        debug(self.cfg, f"[chat] model={model} stream={streaming} "
-                        f"messages={len(native['params']['messages'])} "
-                        f"tools={len(native['params'].get('tools', []))} "
-                        f"threadId={native['threadId']}")
+        started = time.time()
+        log_line(f"[chat] -> model={model} stream={streaming} "
+                 f"messages={len(native['params']['messages'])} "
+                 f"tools={len(native['params'].get('tools', []))} "
+                 f"thread={native['threadId'][:8]}")
 
         client_key = client_key_from_headers(self.headers)
         if streaming:
             self._stream(native, model, client_key)
         else:
             self._buffered(native, model, client_key)
+        log_line(f"[chat] <- done in {time.time() - started:.1f}s "
+                 f"(thread={native['threadId'][:8]})")
 
     # -- upstream plumbing -------------------------------------------------
 
@@ -1567,6 +1600,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
     # -- streaming ---------------------------------------------------------
 
     def _stream(self, native, model, client_key):
+        """Stream a chat completion.
+
+        The critical split: iter_events() *reads the upstream* and _sse_frame()
+        *writes the client*. They must not share a try block. A socket error
+        while reading the upstream is an upstream failure and is retried; only a
+        socket error while writing the client means the client is gone.
+
+        Conflating the two is what silently truncated streams: a mid-stream
+        upstream reset arrives as a bare requests exception (or, on the urllib
+        transport, a raw OSError), was mistaken for a client hang-up, and the
+        response was cut off with no retry, no error frame and no [DONE].
+        """
         cfg = self.cfg
         translator = Translator(model, streaming=True)
         opened = False
@@ -1577,12 +1622,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             while attempt < MAX_ATTEMPTS:
                 attempt += 1
                 key = pick_upstream_key(cfg, client_key)
-                debug(cfg, f"[chat] attempt {attempt}/{MAX_ATTEMPTS} key={mask(key) or '(none)'}")
+                debug(cfg, f"[chat] attempt {attempt}/{MAX_ATTEMPTS} "
+                           f"key={mask(key) or '(none)'}")
                 try:
                     resp = self._post(native, key)
                 except RequestException as exc:
                     last_error = f"{type(exc).__name__}: {exc}"
-                    debug(cfg, f"[chat] transport error: {last_error}")
+                    log_line(f"[chat] 第 {attempt}/{MAX_ATTEMPTS} 次上游请求失败: {last_error}")
                     if not opened and attempt >= MAX_ATTEMPTS:
                         self._send_error(504 if "Timeout" in last_error else 502,
                                          f"上游请求失败（{MAX_ATTEMPTS} 次尝试）：{last_error}",
@@ -1596,7 +1642,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     detail = sanitize_error_text(cfg, upstream_error(resp))
                     resp.close()
                     last_error = detail
-                    debug(cfg, f"[chat] upstream HTTP {status}: {detail}")
+                    log_line(f"[chat] 上游返回 HTTP {status}: {detail}")
                     if self._handle_upstream_failure(cfg, status, detail, attempt,
                                                      attempt < MAX_ATTEMPTS):
                         time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
@@ -1604,7 +1650,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     if not opened:
                         self._send_error(status, detail, "upstream_error")
                         return
-                    # Headers already sent — an SSE frame is the only channel left.
+                    # Already streaming: an SSE error frame is all that is left.
                     translator.error = detail
                     break
 
@@ -1612,27 +1658,42 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self._sse_open()
                     opened = True
 
+                # ---- read upstream (a failure here is retried) --------------
+                upstream_failed = None
+                deltas = 0
                 try:
-                    # A broken upstream raises a RequestException here; a broken
-                    # *client* raises OSError from _sse_frame and must not be
-                    # mistaken for one, so only request errors are caught. The
-                    # client case unwinds to the handler below.
-                    for event in iter_events(resp):
-                        chunks = translator.feed(event)
-                        finished = translator.finished
-                        for chunk in chunks:
-                            self._sse_frame(chunk)
-                        if finished:
+                    events = iter_events(resp)
+                    while True:
+                        try:
+                            event = next(events)
+                        except StopIteration:
                             break
-                except RequestException as exc:
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    debug(cfg, "[chat] 流中断，尝试用同一 threadId 续写")
+                        except Exception as exc:  # noqa: BLE001 -- see docstring
+                            # Reading the upstream broke, whatever type it wears.
+                            upstream_failed = f"{type(exc).__name__}: {exc}"
+                            break
+                        for chunk in translator.feed(event):
+                            # ---- write client (OSError here = client gone) ---
+                            self._sse_frame(chunk)
+                            deltas += 1
+                        if translator.finished:
+                            break
+                except OSError as exc:
+                    # Only _sse_frame can reach this, so the client is gone.
+                    debug(cfg, f"[chat] 客户端已断开: {type(exc).__name__}: {exc}")
+                    return
                 finally:
                     resp.close()
+
+                if upstream_failed:
+                    last_error = upstream_failed
+                    log_line(f"[chat] 第 {attempt}/{MAX_ATTEMPTS} 次上游流中断"
+                             f"（已下发 {deltas} 个增量，将重试续写）: {last_error}")
 
                 if translator.finished:
                     break
                 if attempt >= MAX_ATTEMPTS:
+                    log_line(f"[chat] 重试已用尽，流仍不完整: {last_error}")
                     break
                 time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
 
@@ -1640,17 +1701,36 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send_error(502, f"上游请求失败：{last_error}", "upstream_error")
                 return
 
-            final = translator.finalize()
-            if final:
-                self._sse_frame(final)
-            if translator.error:
-                self._sse_frame({"error": {"message": sanitize_error_text(cfg, translator.error),
-                                           "type": "upstream_error"}})
+            # A recovered stream must look completely normal: translator.finished
+            # is set only by a real `finish` event, so it is the single source of
+            # truth. Keying off `last_error` instead would report a stream that
+            # retried and then finished perfectly as truncated.
+            if not translator.finished:
+                # The stream never completed. end_turn() rewrites finish_reason so
+                # the client is not told "stop" for a truncated answer, and the
+                # error frame names the cause — a silently-ended stream is what
+                # made the agent die without a reason.
+                failure = translator.error or last_error
+                translator.end_turn()
+                ending = translator.take_ending()
+                if ending:
+                    self._sse_frame(ending)
+                self._sse_frame({
+                    "error": {
+                        "message": f"上游流中断（重试 {MAX_ATTEMPTS} 次未完成）：{failure}",
+                        "type": "upstream_error"}})
+            else:
+                final = translator.finalize()
+                if final:
+                    self._sse_frame(final)
+                if translator.error:
+                    self._sse_frame({"error": {
+                        "message": sanitize_error_text(cfg, translator.error),
+                        "type": "upstream_error"}})
             self._sse_raw("data: [DONE]\n\n")
-        except OSError:
-            # The client hung up. Every upstream response is already closed by
-            # the loop's finally, so there is nothing left to release.
-            debug(cfg, "[chat] 客户端已断开")
+        except OSError as exc:
+            # Raised before any frame was written -- the client went away early.
+            debug(cfg, f"[chat] 客户端已断开: {type(exc).__name__}: {exc}")
         finally:
             if opened:
                 self._sse_end()
@@ -1658,11 +1738,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
     # -- buffered ----------------------------------------------------------
 
     def _buffered(self, native, model, client_key):
+        """Non-streaming path: consume the whole upstream stream, then answer
+        once. Every failure here happens before anything reaches the client, so
+        a retry is always safe and nothing can be half-delivered."""
         cfg = self.cfg
         translator = Translator(model, streaming=False)
         attempt = 0
         last_error = None
-        status = None
 
         while attempt < MAX_ATTEMPTS:
             attempt += 1
@@ -1671,7 +1753,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 resp = self._post(native, key)
             except RequestException as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                debug(cfg, f"[chat] transport error: {last_error}")
+                log_line(f"[chat] 第 {attempt}/{MAX_ATTEMPTS} 次上游请求失败: {last_error}")
                 if attempt >= MAX_ATTEMPTS:
                     self._send_error(504 if "Timeout" in last_error else 502,
                                      f"上游请求失败（{MAX_ATTEMPTS} 次尝试）：{last_error}",
@@ -1684,7 +1766,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if status != 200:
                 last_error = sanitize_error_text(cfg, upstream_error(resp))
                 resp.close()
-                debug(cfg, f"[chat] upstream HTTP {status}: {last_error}")
+                log_line(f"[chat] 上游返回 HTTP {status}: {last_error}")
                 if self._handle_upstream_failure(cfg, status, last_error, attempt,
                                                  attempt < MAX_ATTEMPTS):
                     time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
@@ -1693,19 +1775,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                for event in iter_events(resp):
+                events = iter_events(resp)
+                while True:
+                    try:
+                        event = next(events)
+                    except StopIteration:
+                        break
                     translator.feed(event)
                     if translator.finished:
                         break
-            except RequestException as exc:
+            except Exception as exc:  # noqa: BLE001 -- see _stream's docstring
                 last_error = f"{type(exc).__name__}: {exc}"
-                debug(cfg, "[chat] 流中断，尝试用同一 threadId 续写")
+                log_line(f"[chat] 第 {attempt}/{MAX_ATTEMPTS} 次上游流中断"
+                         f"（将重试续写）: {last_error}")
             finally:
                 resp.close()
 
             if translator.finished:
                 break
             if attempt >= MAX_ATTEMPTS:
+                log_line(f"[chat] 重试已用尽，流仍不完整: {last_error}")
                 break
             time.sleep(RETRY_DELAY * (2 ** (attempt - 1)))
 
@@ -1729,7 +1818,7 @@ class BridgeServer(ThreadingHTTPServer):
         if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
                             BrokenPipeError, TimeoutError)):
             if BridgeHandler.cfg:
-                debug(BridgeHandler.cfg, f"[http] {client_address[0]} 连接已断开")
+                log_line(f"[http] {client_address[0]} 连接已断开")
             return
         super().handle_error(request, client_address)
 
@@ -1767,12 +1856,12 @@ def main():
         print("[bridge] client auth:       required (Authorization: Bearer <api_key>)")
 
     server = BridgeServer((cfg["host"], cfg["port"]), BridgeHandler)
-    print(f"[bridge] listening on http://{cfg['host']}:{cfg['port']}/v1  "
-          f"(Ctrl+C to stop)\n")
+    log_line(f"[bridge] listening on http://{cfg['host']}:{cfg['port']}/v1 "
+             f"(Ctrl+C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[bridge] shutting down")
+        log_line("[bridge] shutting down")
     finally:
         server.server_close()
 

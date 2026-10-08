@@ -110,11 +110,38 @@ If a stream breaks mid-response, the retry re-POSTs with the **same `threadId`**
 upstream resumes the generation and the client keeps receiving deltas into the same
 assistant message.
 
+The read/write separation is what makes that continue rather than truncate. Reading the
+upstream and writing the client are kept in **separate** error scopes: a socket error while
+*reading* is an upstream failure and is retried; only a socket error while *writing* means
+the client itself is gone. Conflating the two (as an earlier revision did) turned a
+mid-stream upstream reset into a silently truncated response — no retry, no error frame, no
+`[DONE]` — because the bare `ConnectionResetError` was mistaken for a client hang-up.
+
+If the retries are exhausted the stream still ends cleanly but **says so**: a terminal chunk
+carries `finish_reason: "length"` (deliberately not `"stop"`), an `error` frame names the
+cause, and `[DONE]` follows. A client can therefore always tell a complete answer from a
+truncated one. A stream that broke and then recovered reports nothing at all — a normal
+`finish_reason: "stop"` — since `translator.finished` (set only by a real `finish` event) is
+the single source of truth, not the presence of a past error.
+
 Once *every* key in the pool has come back hard-limited (a 429 carrying
 `Your limit resets at`), the proxy enters a **5-minute cooldown** and answers 429 locally
 with a `Retry-After` header instead of hammering the upstream.
 
 Upstream error text is passed back only after any key appearing in it is masked.
+
+### Logging
+
+The proxy logs to stderr by default — a proxy that fails silently is worse than one that
+fails loudly:
+
+| level | what |
+|---|---|
+| always | startup banner; one line per request; every `->`/`<-` chat with model, stream flag, message/tool counts, `threadId` prefix and elapsed time; every retry, stream interruption, upstream HTTP error and hard-limit cooldown; client disconnects |
+| `debug="true"` | per-attempt key selection, the chattier internals |
+
+Key material never reaches the log in the clear — keys are masked to `user_sTY…uqdH`, and
+any upstream error text is scanned for keys before being returned or logged.
 
 ### Model list
 
