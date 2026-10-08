@@ -42,6 +42,7 @@ DEFAULTS = {
     "taste": "",
     "skills": "",
     "permission_mode": "standard",
+    "proxy": "",
 }
 
 # Headers the command-code CLI sends; forwarded upstream unchanged.
@@ -186,6 +187,12 @@ def get_config():
         print("[warn] no server API key resolved (.env / env vars / auth.json); "
               "requests without a client-supplied key will be unauthorized",
               file=sys.stderr)
+    # Build requests-compatible proxies dict from the single proxy URL.
+    proxy_url = cfg.get("proxy", "").strip()
+    if proxy_url:
+        cfg["proxies"] = {"http": proxy_url, "https": proxy_url}
+    else:
+        cfg["proxies"] = None
     return cfg
 
 
@@ -1346,6 +1353,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     headers=headers,
                     stream=True,
                     timeout=(10, 600),
+                    proxies=cfg.get("proxies"),
                 )
             except requests.RequestException as exc:
                 last_exc = exc
@@ -1842,6 +1850,10 @@ def main():
     else:
         print("[command-code bridge] auth: no server key — relying on client-supplied keys")
     print(f"[command-code bridge] default model: {cfg['default_model']}")
+    if cfg.get("proxies"):
+        print(f"[command-code bridge] proxy: {cfg['proxy']}")
+    else:
+        print("[command-code bridge] proxy: none (direct connection)")
     print(f"[command-code bridge] models catalog ({len(server.models)}): "
           + ", ".join(m["id"] for m in server.models))
     print("[command-code bridge] endpoints: POST /v1/chat/completions, POST /v1/responses, "
