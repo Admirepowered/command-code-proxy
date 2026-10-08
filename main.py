@@ -298,8 +298,13 @@ def convert_tool_choice(tool_choice):
     return None
 
 
+MAX_OUTPUT_TOKENS = 200_000
+
+
 def build_native_body(params, cfg):
     """Wrap converted params in the top-level command-code envelope."""
+    if params.get("max_tokens") is not None:
+        params["max_tokens"] = min(int(params["max_tokens"]), MAX_OUTPUT_TOKENS)
     body = {
         "config": {
             "workingDir": cfg.get("working_dir") or "/tmp",
