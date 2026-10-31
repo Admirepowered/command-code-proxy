@@ -20,10 +20,17 @@ everything below; all of them were verified against the live endpoint:
     always with `stream: true` — a non-streaming request is refused upstream, so
     non-streaming callers get a buffered single-object response instead.
 
+Two client dialects are served from the same pipeline:
+
+    POST /v1/chat/completions      OpenAI Chat Completions
+    POST /v1/messages              Anthropic Messages (stream + non-stream)
+    POST /v1/messages/count_tokens Anthropic token count (local estimate)
+
 Single file. `requests` is used when available and the stdlib urllib shim below
 takes over when it is not.   Run:  python main.py
 """
 
+import fnmatch
 import hmac
 import json
 import os
@@ -70,6 +77,10 @@ DEFAULTS = {
     "debug": "",
     # models
     "default_model": "deepseek/deepseek-v4-flash",
+    # Anthropic clients (Claude Code, the SDKs) name models the upstream does not
+    # have. "pattern=target,pattern=target" (fnmatch, case-insensitive) rewrites
+    # them; any other `claude*` name falls back to default_model.
+    "model_map": "",
     "models": "",  # optional comma-separated filter/order for GET /v1/models
     "models_ttl": "300",  # seconds the upstream model list is cached
     # OAuth (used only when no key can be found anywhere)
@@ -1367,6 +1378,424 @@ def upstream_error(resp):
 
 
 # ---------------------------------------------------------------------------
+# Anthropic Messages API  <->  the same native pipeline
+#
+# Requests are normalised into the OpenAI shape and then go through
+# convert_request(), so exactly one place knows the native schema. Responses are
+# produced straight from native events by AnthropicTranslator, which subclasses
+# Translator so that text / reasoning / tool-call accumulation, usage and
+# finish handling stay shared with the OpenAI path.
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_ERROR_TYPES = frozenset({
+    "invalid_request_error", "authentication_error", "permission_error",
+    "not_found_error", "request_too_large", "rate_limit_error", "api_error",
+    "overloaded_error",
+})
+
+
+def anthropic_error_type(etype, status=500):
+    """Map the bridge's error labels / HTTP status onto Anthropic's error types."""
+    if etype in ANTHROPIC_ERROR_TYPES:
+        return etype
+    return {
+        400: "invalid_request_error", 401: "authentication_error",
+        403: "permission_error", 404: "not_found_error",
+        413: "request_too_large", 422: "invalid_request_error",
+        429: "rate_limit_error", 503: "overloaded_error", 529: "overloaded_error",
+    }.get(status, "api_error")
+
+
+def anthropic_text(content):
+    """Flatten an Anthropic content value (string or blocks) into plain text.
+    Media becomes a placeholder, exactly as parts_to_text does for OpenAI."""
+    if isinstance(content, str):
+        return content
+    out = []
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, str):
+            out.append(block)
+        elif isinstance(block, dict):
+            btype = block.get("type")
+            if btype in ("image", "document"):
+                out.append(f"[{btype}]")
+            elif isinstance(block.get("text"), str):
+                out.append(block["text"])
+    return "\n".join(t for t in out if t)
+
+
+def resolve_model(cfg, requested):
+    """Rewrite a client-facing model name into one the upstream knows."""
+    if not requested:
+        return cfg["default_model"]
+    lowered = requested.lower()
+    for pair in (cfg.get("model_map") or "").split(","):
+        pattern, _, target = pair.partition("=")
+        pattern, target = pattern.strip().lower(), target.strip()
+        if pattern and target and fnmatch.fnmatchcase(lowered, pattern):
+            return target
+    return cfg["default_model"] if lowered.startswith("claude") else requested
+
+
+def anthropic_tools(tools):
+    """Anthropic tool defs -> OpenAI function tools. Typed client tools with no
+    schema (bash_2025…, text_editor_…, computer_…) have no native equivalent
+    and are skipped; the built-in web tools pass straight through."""
+    out = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        ttype = tool.get("type")
+        if ttype in ("web_search_20250305", "web_fetch_20250910"):
+            out.append(tool)
+        elif ttype in (None, "custom") and tool.get("name"):
+            out.append({"type": "function", "function": {
+                "name": tool["name"],
+                "description": tool.get("description") or "",
+                "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            }})
+    return out
+
+
+def anthropic_tool_choice(choice):
+    if not isinstance(choice, dict):
+        return None
+    kind = choice.get("type")
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "none":
+        return "none"
+    if kind == "tool" and choice.get("name"):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    return None
+
+
+def anthropic_reasoning_effort(req):
+    """`output_config.effort` wins; otherwise the extended-thinking budget is
+    bucketed into low / medium / high. Thinking disabled -> nothing is sent."""
+    out_cfg = req.get("output_config")
+    effort = out_cfg.get("effort") if isinstance(out_cfg, dict) else None
+    if effort in ("low", "medium", "high"):
+        return effort
+    if effort in ("max", "xhigh"):
+        return "high"
+    thinking = req.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive"):
+        budget = thinking.get("budget_tokens")
+        if not isinstance(budget, (int, float)):
+            return "medium"
+        return "low" if budget <= 2048 else "medium" if budget <= 16000 else "high"
+    return None
+
+
+def _flush_user_text(messages, pending):
+    text = "\n".join(t for t in pending if t)
+    pending.clear()
+    if text:
+        messages.append({"role": "user", "content": text})
+
+
+def anthropic_to_openai(req, cfg):
+    """Normalise an Anthropic /v1/messages body into an OpenAI chat body.
+
+    * `system` (string or blocks) becomes the system message.
+    * assistant `tool_use` blocks become `tool_calls`; `thinking` blocks become
+      `reasoning_content`. redacted_thinking and server-tool blocks are dropped.
+    * user `tool_result` blocks become `tool` messages, kept in order relative
+      to the surrounding text, so a user turn like [tool_result, text] maps to
+      tool message then user message.
+    """
+    messages = []
+    system = anthropic_text(req.get("system"))
+    if system:
+        messages.append({"role": "system", "content": system})
+
+    for msg in req.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
+        role, content = msg.get("role"), msg.get("content")
+        if isinstance(content, str):
+            blocks = [{"type": "text", "text": content}]
+        else:
+            blocks = [b for b in (content or []) if isinstance(b, dict)]
+
+        if role == "assistant":
+            texts, reasoning, calls = [], [], []
+            for block in blocks:
+                btype = block.get("type")
+                if btype == "text":
+                    texts.append(block.get("text") or "")
+                elif btype == "thinking":
+                    reasoning.append(block.get("thinking") or "")
+                elif btype == "tool_use":
+                    tool_input = block.get("input")
+                    calls.append({
+                        "id": block.get("id") or "",
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name") or "",
+                            "arguments": json.dumps(tool_input if tool_input is not None else {},
+                                                    ensure_ascii=False),
+                        },
+                    })
+            out = {"role": "assistant", "content": "".join(texts)}
+            if any(reasoning):
+                out["reasoning_content"] = "".join(reasoning)
+            if calls:
+                out["tool_calls"] = calls
+            messages.append(out)
+
+        elif role == "user":
+            pending = []
+            for block in blocks:
+                btype = block.get("type")
+                if btype == "tool_result":
+                    _flush_user_text(messages, pending)
+                    text = anthropic_text(block.get("content"))
+                    if block.get("is_error"):
+                        text = f"Error: {text}" if text else "Error"
+                    messages.append({"role": "tool",
+                                     "tool_call_id": block.get("tool_use_id") or "",
+                                     "content": text})
+                elif btype in ("text", "image", "document"):
+                    pending.append(anthropic_text([block]))
+            _flush_user_text(messages, pending)
+
+    out = {
+        "model": resolve_model(cfg, req.get("model")),
+        "messages": messages,
+        "stream": req.get("stream") is True,
+    }
+    for key in ("max_tokens", "temperature", "top_p"):
+        if req.get(key) is not None:
+            out[key] = req[key]
+    if req.get("stop_sequences"):
+        out["stop"] = req["stop_sequences"]
+    tools = anthropic_tools(req.get("tools"))
+    if tools:
+        out["tools"] = tools
+        choice = anthropic_tool_choice(req.get("tool_choice"))
+        if choice is not None:
+            out["tool_choice"] = choice
+    effort = anthropic_reasoning_effort(req)
+    if effort:
+        out["reasoning_effort"] = effort
+    return out
+
+
+def estimate_tokens(text):
+    """Cheap local token estimate: ~4 ASCII chars per token, ~1 token per other
+    character (CJK and friends). Good enough for context-budget checks."""
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    return max(1, ascii_chars // 4 + (len(text) - ascii_chars))
+
+
+def anthropic_usage(total):
+    """Native usage -> Anthropic usage. The native `inputTokens` includes cache
+    reads (like OpenAI's prompt_tokens), while Anthropic reports them
+    separately, so the cached part is subtracted from `input_tokens`."""
+    total = total or {}
+    inp, out = total.get("inputTokens") or 0, total.get("outputTokens") or 0
+    details = total.get("inputTokenDetails") or {}
+    read, write = details.get("cacheReadTokens") or 0, details.get("cacheWriteTokens") or 0
+    return {
+        "input_tokens": max(inp - read - write, 0),
+        "output_tokens": out,
+        "cache_creation_input_tokens": write,
+        "cache_read_input_tokens": read,
+    }
+
+
+def anthropic_tool_id(raw):
+    """Anthropic ids are [A-Za-z0-9_-]+; upstream ids are not guaranteed to be."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", raw or "") or f"toolu_{uuid.uuid4().hex[:24]}"
+
+
+def tool_input_json(raw):
+    """Normalise accumulated tool arguments into the text of a JSON *object*.
+    Anthropic clients json-parse the concatenated partial_json and fail hard on
+    anything else, so empty -> {} and unparseable input is wrapped, not lost."""
+    text = (raw or "").strip()
+    if not text:
+        return "{}"
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return json.dumps({"_raw": text}, ensure_ascii=False)
+    if not isinstance(value, dict):
+        return json.dumps({"value": value}, ensure_ascii=False)
+    return text
+
+
+def models_to_anthropic(payload):
+    """OpenAI model list -> Anthropic `GET /v1/models` shape."""
+    data = []
+    for item in payload.get("data") or []:
+        created = item.get("created") or int(time.time())
+        data.append({
+            "type": "model",
+            "id": item["id"],
+            "display_name": item.get("name") or item["id"],
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created)),
+        })
+    return {"data": data, "has_more": False,
+            "first_id": data[0]["id"] if data else None,
+            "last_id": data[-1]["id"] if data else None}
+
+
+class AnthropicTranslator(Translator):
+    """Consumes native events and emits Anthropic Messages events.
+
+    Same interface as Translator (feed / finished / error / end_turn /
+    take_ending / completion), so the retrying stream loops are shared.
+
+    Streaming shape: message_start, then content blocks in order
+    (thinking | text | tool_use), then message_delta + message_stop.
+    Text and thinking stream token by token. A tool_use block is emitted whole
+    (start, one input_json_delta, stop) once its arguments are complete: blocks
+    are strictly sequential in this protocol, so interleaved tool-input deltas
+    cannot be streamed safely, and no client acts on half a tool call anyway.
+    """
+
+    STOP_REASONS = {"tool_calls": "tool_use", "length": "max_tokens"}
+
+    def __init__(self, model, streaming):
+        super().__init__(model, streaming=False)  # the parent only accumulates here
+        self.stream = streaming
+        self.id = f"msg_{uuid.uuid4().hex[:24]}"
+        self.raw_usage = {}
+        self._started = False
+        self._open = None        # kind of the block currently open: text | thinking
+        self._index = -1         # index of the most recently opened block
+        self._flushed = set()    # tool_calls indices already emitted as blocks
+
+    # -- block plumbing ----------------------------------------------------
+
+    def _open_block(self, kind, out):
+        if self._open == kind:
+            return
+        self._close_block(out)
+        self._index += 1
+        body = {"type": "text", "text": ""} if kind == "text" else {"type": "thinking", "thinking": ""}
+        out.append({"type": "content_block_start", "index": self._index, "content_block": body})
+        self._open = kind
+
+    def _close_block(self, out):
+        if self._open is not None:
+            out.append({"type": "content_block_stop", "index": self._index})
+            self._open = None
+
+    def _delta(self, delta):
+        return {"type": "content_block_delta", "index": self._index, "delta": delta}
+
+    def _flush_tool(self, index, out):
+        if index in self._flushed or not 0 <= index < len(self.tool_calls):
+            return
+        call = self.tool_calls[index]
+        if not call["name"]:
+            return
+        self._flushed.add(index)
+        self._close_block(out)
+        self._index += 1
+        out.append({"type": "content_block_start", "index": self._index, "content_block": {
+            "type": "tool_use", "id": anthropic_tool_id(call["id"]),
+            "name": call["name"], "input": {}}})
+        out.append(self._delta({"type": "input_json_delta",
+                                "partial_json": tool_input_json(call["args"])}))
+        out.append({"type": "content_block_stop", "index": self._index})
+
+    def _stop_reason(self):
+        stop = self.STOP_REASONS.get(self.finish_reason or "stop", "end_turn")
+        return "tool_use" if stop == "end_turn" and self._flushed else stop
+
+    # -- event handling ----------------------------------------------------
+
+    def feed(self, event):
+        etype = event.get("type")
+        super().feed(event)  # accumulate text / reasoning / tool calls / usage / error
+        if etype == "finish":
+            self.raw_usage = event.get("totalUsage") or {}
+        if not self.stream or self.error:
+            return []
+
+        out = []
+        if not self._started:
+            self._started = True
+            out.append({"type": "message_start", "message": {
+                "id": self.id, "type": "message", "role": "assistant", "model": self.model,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0}}})
+
+        if etype == "text-delta":
+            text = event.get("text") or ""
+            if text:
+                self._open_block("text", out)
+                out.append(self._delta({"type": "text_delta", "text": text}))
+        elif etype == "reasoning-delta":
+            text = event.get("text") or ""
+            if text:
+                self._open_block("thinking", out)
+                out.append(self._delta({"type": "thinking_delta", "thinking": text}))
+        elif etype == "tool-input-end":
+            index = self._by_id.get(event.get("id"))
+            # Empty args here means the complete `tool-call` event still has to
+            # fill them in, so only flush when the deltas already delivered them.
+            if index is not None and self.tool_calls[index]["args"]:
+                self._flush_tool(index, out)
+        elif etype == "tool-call":
+            call_id = event.get("toolCallId") or event.get("id") or ""
+            self._flush_tool(self._by_id.get(call_id, len(self.tool_calls) - 1), out)
+        elif etype == "finish":
+            for index in range(len(self.tool_calls)):
+                self._flush_tool(index, out)
+            self._close_block(out)
+            out.append({"type": "message_delta",
+                        "delta": {"stop_reason": self._stop_reason(), "stop_sequence": None},
+                        "usage": anthropic_usage(self.raw_usage)})
+            out.append({"type": "message_stop"})
+        return out
+
+    def finalize(self):
+        self.finished = True
+        return None
+
+    def end_turn(self, reason="length"):
+        """The upstream stream died. Anthropic's contract for that is an `error`
+        event with no message_stop — claiming max_tokens would hide the failure —
+        so only the open block is closed here; the handler adds the error."""
+        self.finished = True
+        self.finish_reason = reason
+        out = []
+        self._close_block(out)
+        self._pending = out[0] if out else None
+
+    # -- buffered output ---------------------------------------------------
+
+    def completion(self):
+        content = []
+        if self.reasoning:
+            content.append({"type": "thinking", "thinking": "".join(self.reasoning),
+                            "signature": ""})
+        text = "".join(self.text)
+        if text:
+            content.append({"type": "text", "text": text})
+        for index, call in enumerate(self.tool_calls):
+            if not call["name"]:
+                continue
+            self._flushed.add(index)
+            content.append({"type": "tool_use", "id": anthropic_tool_id(call["id"]),
+                            "name": call["name"],
+                            "input": json.loads(tool_input_json(call["args"]))})
+        if not content:
+            content.append({"type": "text", "text": ""})
+        return {"id": self.id, "type": "message", "role": "assistant", "model": self.model,
+                "content": content, "stop_reason": self._stop_reason(), "stop_sequence": None,
+                "usage": anthropic_usage(self.raw_usage)}
+
+
+# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 
@@ -1375,6 +1804,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "command-code-bridge/2.0"
     cfg = None  # set in main()
+    _wire = "openai"  # per request: which client dialect is being spoken
 
     # -- plumbing ----------------------------------------------------------
 
@@ -1410,7 +1840,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers",
-                         "Authorization, Content-Type, x-api-key")
+                         "Authorization, Content-Type, x-api-key, "
+                         "anthropic-version, anthropic-beta")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
     def _send_json(self, status, obj):
@@ -1422,8 +1853,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _route(self):
+        """Normalise the request path and pick the client dialect for it. The
+        handler instance is reused across keep-alive requests, so this runs at
+        the top of every do_*."""
+        path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+        self._wire = "anthropic" if (
+            path.startswith("/v1/messages")
+            or (path != "/v1/chat/completions" and self.headers.get("anthropic-version"))
+        ) else "openai"
+        return path
+
+    def _error_body(self, message, etype="invalid_request_error", status=500):
+        if self._wire == "anthropic":
+            return {"type": "error",
+                    "error": {"type": anthropic_error_type(etype, status), "message": message}}
+        return {"error": {"message": message, "type": etype}}
+
     def _send_error(self, status, message, etype="invalid_request_error"):
-        self._send_json(status, {"error": {"message": message, "type": etype}})
+        self._send_json(status, self._error_body(message, etype, status))
 
     # -- SSE ---------------------------------------------------------------
 
@@ -1437,7 +1885,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _sse_frame(self, obj):
-        self._sse_raw("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
+        body = json.dumps(obj, ensure_ascii=False)
+        if self._wire == "anthropic":  # named events, no [DONE] sentinel
+            self._sse_raw(f"event: {obj.get('type', 'message')}\ndata: {body}\n\n")
+        else:
+            self._sse_raw("data: " + body + "\n\n")
 
     def _sse_raw(self, text):
         data = text.encode("utf-8")
@@ -1473,7 +1925,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+        path = self._route()
         if path in ("/health", "/healthz"):
             self._send_json(200, {
                 "status": "ok",
@@ -1493,11 +1945,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # be left unread and the next request on this keep-alive connection
         # would be parsed as its body.
         raw = self._read_body()
-        path = urllib.parse.urlsplit(self.path).path.rstrip("/")
-        if path != "/v1/chat/completions":
+        path = self._route()
+        if path in ("/v1/chat/completions", "/v1/messages"):
+            self._handle_chat(raw)
+        elif path == "/v1/messages/count_tokens":
+            self._handle_count_tokens(raw)
+        else:
             self._send_error(404, f"Unknown path: {self.path}", "not_found_error")
-            return
-        self._handle_chat(raw)
 
     # -- handlers ----------------------------------------------------------
 
@@ -1510,7 +1964,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_error(502, f"Failed to fetch model list: {exc}", "upstream_error")
             return
-        self._send_json(200, payload)
+        self._send_json(200, models_to_anthropic(payload) if self._wire == "anthropic"
+                        else payload)
+
+    def _handle_count_tokens(self, raw):
+        """Anthropic's count_tokens, answered locally with an estimate — the
+        upstream has no such endpoint, and clients only need it for budgeting."""
+        if not self._authorized():
+            self._send_error(401, "Missing or invalid proxy API key", "authentication_error")
+            return
+        try:
+            req = json.loads(raw.decode("utf-8") or "{}")
+            if not isinstance(req, dict):
+                raise ValueError("body must be a JSON object")
+            converted = anthropic_to_openai(req, self.cfg)
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._send_error(400, f"Invalid request: {exc}")
+            return
+        text = json.dumps([converted["messages"], converted.get("tools", [])],
+                          ensure_ascii=False)
+        self._send_json(200, {"input_tokens": estimate_tokens(text)})
 
     def _handle_chat(self, raw):
         if not self._authorized():
@@ -1536,10 +2009,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_response(429)
             self.send_header("Retry-After", str(retry_after))
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            payload = json.dumps({"error": {
-                "message": f"上游限流冷却中，{retry_after}s 后重试",
-                "type": "rate_limit_error",
-            }}, ensure_ascii=False).encode("utf-8")
+            payload = json.dumps(self._error_body(
+                f"上游限流冷却中，{retry_after}s 后重试", "rate_limit_error", 429),
+                ensure_ascii=False).encode("utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self._cors()
             self.end_headers()
@@ -1547,8 +2019,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
 
         streaming = req.get("stream") is True
-        model = req.get("model") or self.cfg["default_model"]
+        model = req.get("model") or self.cfg["default_model"]  # echoed back to the client
         try:
+            if self._wire == "anthropic":
+                req = anthropic_to_openai(req, self.cfg)
             native = convert_request(req, self.cfg)
         except Exception as exc:
             self._send_error(400, f"Request conversion failed: {exc}")
@@ -1569,6 +2043,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                  f"(thread={native['threadId'][:8]})")
 
     # -- upstream plumbing -------------------------------------------------
+
+    def _translator(self, model, streaming):
+        cls = AnthropicTranslator if self._wire == "anthropic" else Translator
+        return cls(model, streaming=streaming)
 
     def _post(self, native, key):
         headers = dict(UPSTREAM_HEADERS)
@@ -1613,7 +2091,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         response was cut off with no retry, no error frame and no [DONE].
         """
         cfg = self.cfg
-        translator = Translator(model, streaming=True)
+        translator = self._translator(model, streaming=True)
         opened = False
         attempt = 0
         last_error = None
@@ -1715,19 +2193,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 ending = translator.take_ending()
                 if ending:
                     self._sse_frame(ending)
-                self._sse_frame({
-                    "error": {
-                        "message": f"上游流中断（重试 {MAX_ATTEMPTS} 次未完成）：{failure}",
-                        "type": "upstream_error"}})
+                self._sse_frame(self._error_body(
+                    f"上游流中断（重试 {MAX_ATTEMPTS} 次未完成）：{failure}",
+                    "upstream_error"))
             else:
                 final = translator.finalize()
                 if final:
                     self._sse_frame(final)
                 if translator.error:
-                    self._sse_frame({"error": {
-                        "message": sanitize_error_text(cfg, translator.error),
-                        "type": "upstream_error"}})
-            self._sse_raw("data: [DONE]\n\n")
+                    self._sse_frame(self._error_body(
+                        sanitize_error_text(cfg, translator.error), "upstream_error"))
+            if self._wire != "anthropic":
+                self._sse_raw("data: [DONE]\n\n")
         except OSError as exc:
             # Raised before any frame was written -- the client went away early.
             debug(cfg, f"[chat] 客户端已断开: {type(exc).__name__}: {exc}")
@@ -1742,7 +2219,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         once. Every failure here happens before anything reaches the client, so
         a retry is always safe and nothing can be half-delivered."""
         cfg = self.cfg
-        translator = Translator(model, streaming=False)
+        translator = self._translator(model, streaming=False)
         attempt = 0
         last_error = None
 
@@ -1846,6 +2323,9 @@ def main():
           + ("requests" if requests is not None else "urllib (stdlib fallback)"))
     print(f"[bridge] models endpoint:   {cfg['models_url']}")
     print(f"[bridge] default model:     {cfg['default_model']}")
+    print("[bridge] anthropic API:     POST /v1/messages"
+          + (f"  (model_map: {cfg['model_map']})" if cfg["model_map"]
+             else "  (claude* models -> default model)"))
     print(f"[bridge] cli disguise:      workingDir={cfg['working_dir']} "
           f"slug={cfg['project_slug']}")
     if cfg["proxy"]:
